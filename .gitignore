@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 脚本运行产生的临时文件
+.skin-from-cache.png
+.icon-from-skin.png
+*.tmp-oneclick
+
+# 备份文件（含用户自己的原始文件，不应提交）
+*.backup-*
+*.backup-oneclick-*
+*.before-restore
+
+# 用户自己的素材（皮肤/图标含个人内容，不要提交）
+my_skin.png
+my_icon.png
+preview_head.png
+check_*.png
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+*~
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# 测试与调试产物
+test/
+test2/
+*.log
