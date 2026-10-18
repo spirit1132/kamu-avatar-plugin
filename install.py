@@ -47,15 +47,18 @@ from datetime import datetime
 
 # ----------------------------------------------------------------- 依赖检查
 
-try:
-    from PIL import Image
-except ImportError:
-    print('缺少 Pillow。请先安装：')
-    print('    pip install Pillow')
-    sys.exit(1)
-
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+# Pillow 由 env_check 统一检查/安装，失败时给出可执行的修复命令。
+# 这里不直接 import，先确保模块可用再导入，避免裸 ImportError。
+try:
+    import env_check
+except Exception as exc:
+    print('缺少 env_check.py（依赖检查模块）：%s' % exc)
+    print('请确认它和 install.py 在同一目录下：%s' % HERE)
+    sys.exit(1)
 
 # 复用补丁工具的核心逻辑
 try:
@@ -64,8 +67,20 @@ try:
     import safe_replace
 except Exception as exc:
     print('无法导入 patch_icons.py / patch_splash_avatar.py / safe_replace.py：%s' % exc)
-    print('请确认这些文件都在同一目录下。')
+    print('请确认这些文件都在同一目录下：%s' % HERE)
     sys.exit(1)
+
+
+def require_pillow():
+    """
+    确保 Pillow 可用后再导入，并返回 Image 模块。
+
+    不能写成模块顶层的 `from PIL import Image`：如果在同一进程里刚把 Pillow
+    装上，顶层导入早已失败过了。所以统一在 main() 里检查完依赖之后调用。
+    """
+    env_check.require('PIL', '图像处理需要 Pillow（皮肤裁切、图标生成）')
+    from PIL import Image
+    return Image
 
 
 
@@ -217,6 +232,7 @@ def make_avatar_icon(skin_png_bytes, out_path):
     """
     由皮肤生成图标：裁出头部（含帽子层）+ 圆角背景。
     """
+    Image = require_pillow()
     img = Image.open(io.BytesIO(skin_png_bytes)).convert('RGBA')
     w, h = img.size
     if w >= 64 and h >= 32:
@@ -529,7 +545,7 @@ def cmd_list(root, asar, userdata):
                     dim('吉祥物皮肤：%d 字节，%dx%d' %
                         (len(raw), *struct.unpack('>II', raw[16:24])))
                     try:
-                        from PIL import Image as _Image
+                        _Image = require_pillow()
                         detected = patch_splash_avatar.detect_skin_variant(
                             _Image.open(io.BytesIO(raw))) or '?'
                         declared = patch_splash_avatar._declared_variant(txt)
@@ -585,7 +601,19 @@ def main():
     ap.add_argument('--list', action='store_true', help='只看当前状态')
     ap.add_argument('--dry-run', action='store_true', help='试运行，不写文件')
     ap.add_argument('--force', action='store_true', help='KAMUCL 运行中也强制继续（不推荐）')
+    ap.add_argument('--no-install-deps', action='store_true',
+                    help='缺少 Python 依赖时不自动安装，只提示')
+    ap.add_argument('--yes', '-y', action='store_true',
+                    help='自动安装依赖时不询问')
     args = ap.parse_args()
+
+    # 依赖检查放在最前面：Pillow 缺失时装上再继续，避免后面才崩
+    if not env_check.ensure_requirements(
+            auto_install=not args.no_install_deps,
+            interactive=not args.yes,
+            quiet=args.list):
+        err('Python 依赖不完整，已停止。')
+        sys.exit(1)
 
     root = find_kamucl_root(args.kamu_dir)
     asar = find_asar(root) if root else None

@@ -22,21 +22,24 @@ if errorlevel 1 (
     exit /b 1
 )
 
-python -c "import PIL" >nul 2>nul
-if errorlevel 1 (
-    echo   Pillow not found, installing...
-    echo.
-    python -m pip install Pillow
-    if errorlevel 1 (
-        echo.
-        echo   [ERROR] Pillow install failed. Run manually:
-        echo       pip install Pillow
-        echo.
-        pause
-        exit /b 1
-    )
-    echo.
+rem ---- environment check: Python version + Pillow (auto install if missing) ----
+rem Only forward "don't ask" switches; other args belong to install.py.
+set "ENVARGS="
+for %%A in (%*) do (
+    if /I "%%A"=="-y" set "ENVARGS=-y"
+    if /I "%%A"=="--yes" set "ENVARGS=-y"
+    if /I "%%A"=="--no-install-deps" set "ENVARGS=--no-install"
 )
+python "%~dp0env_check.py" !ENVARGS!
+if errorlevel 1 (
+    echo.
+    echo   [ERROR] Environment check failed.
+    echo   Fix the dependency above, then run this file again.
+    echo.
+    pause
+    exit /b 1
+)
+echo.
 
 tasklist /FI "IMAGENAME eq KAMUCL.exe" 2>nul | find /I "KAMUCL.exe" >nul
 if not errorlevel 1 (

@@ -51,11 +51,16 @@ import struct
 import sys
 from datetime import datetime
 
-try:
+# 依赖检查与自动安装统一走 env_check；不要把这里写成裸 ImportError。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import env_check
+
+
+def pillow():
+    """确保 Pillow 可用后返回 PIL.Image（延迟导入，支持同进程刚装好的情况）。"""
+    env_check.require('PIL', '皮肤裁切需要 Pillow')
     from PIL import Image
-except ImportError:
-    print("需要 Pillow：pip install Pillow", file=sys.stderr)
-    sys.exit(1)
+    return Image
 
 # 启动动画头像在 asar 里的路径（文件名带 hash，用前缀匹配）
 SPLASH_FACE_PREFIX = "out/renderer/assets/splash-face-"
@@ -239,8 +244,9 @@ def _integrity(data, block_size=4194304):
 
 # ------------------------------------------------------------- 头像裁切
 
-def crop_head(skin: Image.Image) -> Image.Image:
+def crop_head(skin):
     """从皮肤贴图裁出头部（含帽子/头发叠加层）。"""
+    Image = pillow()
     w, h = skin.size
     unit = w / 64.0
     modern = (h / unit) >= 64  # 高度达到 64 单位才有帽子层
@@ -259,6 +265,7 @@ def crop_head(skin: Image.Image) -> Image.Image:
 
 def prepare_avatar(path: str) -> bytes:
     """读入任意图片，产出启动动画用的 256x256 PNG 字节。"""
+    Image = pillow()
     try:
         img = Image.open(path)
         img.load()
@@ -305,13 +312,14 @@ def build_face_module(png_bytes: bytes, template: bytes) -> bytes:
 SLIM_PROBE = (54, 20, 1, 12)
 
 
-def detect_skin_variant(skin: Image.Image):
+def detect_skin_variant(skin):
     """
     返回 'slim' / 'classic'。
 
     与 KAMUCL detectSkinVariant 同算法；取不到数据时返回 None（调用方按 classic 处理）。
     """
     try:
+        Image = pillow()
         probe = skin.convert("RGBA")
         if probe.size != (64, 64):
             probe = probe.resize((64, 64), Image.NEAREST)
@@ -325,7 +333,7 @@ def detect_skin_variant(skin: Image.Image):
         return None
 
 
-def _convert_legacy_skin(skin: Image.Image) -> Image.Image:
+def _convert_legacy_skin(skin):
     """
     64x32 旧版皮肤 -> 64x64 现代格式。
 
@@ -334,6 +342,7 @@ def _convert_legacy_skin(skin: Image.Image) -> Image.Image:
       2. 镜像复制四肢右侧到左侧，补全旧版缺失的背面贴图区域
       3. 整图完全不透明时，清掉帽子叠加层（否则会盖住头部）
     """
+    Image = pillow()
     if skin.size != (64, 32):
         skin = skin.resize((64, 32), Image.NEAREST)
 
@@ -378,8 +387,11 @@ def prepare_mascot_skin(path: str, variant: str = None):
     正确做法是保留 slim 布局，并把模型类型一起写进模块。
     """
     try:
+        Image = pillow()
         img = Image.open(path)
         img.load()
+    except SystemExit:
+        raise
     except Exception as exc:
         raise SystemExit("无法读取图片：%s (%s)" % (path, exc))
 
@@ -538,6 +550,7 @@ def _describe_png(data, rel, label):
     # 吉祥物模块额外报告皮肤模型类型
     if label == "吉祥物皮肤" and m:
         try:
+            Image = pillow()
             skin = Image.open(io.BytesIO(base64.b64decode(m.group(1))))
             detected = detect_skin_variant(skin) or "?"
             declared = _declared_variant(text)
@@ -636,6 +649,9 @@ def main():
     if not (args.list or args.skin):
         ap.print_help()
         return
+
+    # 入口处确保依赖就绪：缺 Pillow 就装，装不上再退，而不是等到裁图时才崩
+    env_check.require_or_install('PIL', '裁切皮肤、生成贴图需要 Pillow')
 
     asar_path = find_asar(args.asar, args.kamu_dir)
     asar = Asar(asar_path)

@@ -44,11 +44,16 @@ import sys
 import zlib
 from datetime import datetime
 
-try:
+# 依赖检查与自动安装统一走 env_check；不要把这里写成裸 ImportError。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import env_check
+
+
+def pillow():
+    """确保 Pillow 可用后返回 PIL.Image（延迟导入，支持同进程刚装好的情况）。"""
+    env_check.require('PIL', '图标生成需要 Pillow')
     from PIL import Image
-except ImportError:
-    print("需要 Pillow：pip install Pillow", file=sys.stderr)
-    sys.exit(1)
+    return Image
 
 # 标准图标尺寸（Windows 会按需挑选）
 ICON_SIZES = [16, 24, 32, 48, 64, 128, 256]
@@ -401,6 +406,7 @@ def _png_bytes(img):
 
 def _quantize(img):
     """量化到调色板 PNG（大幅减小体积，PE 图标完全支持）。"""
+    Image = pillow()
     try:
         return img.quantize(colors=255, method=Image.FASTOCTREE, dither=Image.NONE)
     except Exception:
@@ -416,6 +422,7 @@ def make_icon_pngs(src_path, budget=None):
       2) 缩小超大尺寸（256 -> 128）
     像素风图片用 NEAREST 缩放保持锐利。
     """
+    Image = pillow()
     img = Image.open(src_path)
     img.load()
     img = img.convert('RGBA')
@@ -582,6 +589,9 @@ def main():
     if not (args.list or args.icon):
         ap.print_help()
         return
+
+    # 入口处确保依赖就绪：缺 Pillow 就装，装不上再退
+    env_check.require_or_install('PIL', '生成各尺寸图标需要 Pillow')
 
     targets = find_targets(args.kamu_dir)
     if not any(targets.values()):

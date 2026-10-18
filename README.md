@@ -461,6 +461,7 @@ kamu_avatar_plugin\
 ├─ patch_splash_avatar.py       启动动画头像 + 吉祥物皮肤补丁工具
 ├─ patch_icons.py               程序图标补丁工具
 ├─ safe_replace.py              安全替换（先验证再替换，无备份）
+├─ env_check.py                 环境依赖检查与自动安装
 ├─ test_mascot_variant.py       slim / classic 模型类型回归测试
 ├─ LICENSE                      MIT 许可证
 ├─ .gitignore
@@ -470,11 +471,12 @@ kamu_avatar_plugin\
 ### 发布/分发时的最小文件集
 
 只发两个 `.bat` **不能用**（它们只是入口，实际执行的是 `install.py`）。
-必须一起打包这 7 个文件（约 90 KB），且**必须放在同一目录**：
+必须一起打包这 8 个文件（约 110 KB），且**必须放在同一目录**：
 
 ```
 一键美化.bat
 install.py
+env_check.py
 safe_replace.py
 patch_icons.py
 patch_splash_avatar.py
@@ -487,8 +489,64 @@ plugin.json
 ### 运行环境要求
 
 - **Windows**（脚本调用 Win32 API 与 `tasklist`/`taskkill`，不支持 Linux/macOS）
-- **Python 3**
-- **Pillow**（`一键美化.bat` 会自动尝试安装）
+- **Python 3.6 或更高**
+- **Pillow**（图像处理）——**缺失时会自动安装**
+
+### 环境检查与自动安装
+
+所有依赖的检查和安装集中在一个脚本 [env_check.py](env_check.py) 里，
+`install.py`、`patch_icons.py`、`patch_splash_avatar.py` 和
+`一键美化.bat` 都会先过它一遍。
+
+单独运行：
+
+```cmd
+python env_check.py              # 检查并（询问后）安装
+python env_check.py --list       # 只看状态
+python env_check.py --yes        # 不问，直接装
+python env_check.py --no-install # 只检查，不安装
+```
+
+`--list` 的输出：
+
+```
+  ✓ Python 3.13.2
+    解释器：D:\python\python.exe
+    虚拟环境：否
+
+  ✓ Pillow 12.3.0（必需，图像处理（皮肤裁切、图标生成））
+
+  ✓ pip 可用
+```
+
+自动安装会按顺序尝试，直到成功：
+
+1. 默认源 `python -m pip install --upgrade Pillow`
+2. `--user` 模式（应对全局站点包无写权限）
+3. 清华镜像、阿里云镜像（应对默认源超时）
+
+若连 pip 都没有（精简版 Python、部分 venv），会先跑
+`python -m ensurepip --upgrade` 把 pip 修好再装，**不需要联网下载 get-pip**。
+
+安装完会再复查一次 `import`，防止 pip 报告成功但实际装到了别的解释器。
+全部失败时给出可直接复制执行的命令，包括：
+
+- 三条安装命令（默认 / `--user` / 镜像）
+- `ensurepip` 修复命令
+- 设置全局镜像源的命令（国内网络慢时）
+
+**控制环境行为的开关：**
+
+| 方式 | 作用 |
+|---|---|
+| `--no-install-deps`（install.py） | 缺依赖时不自动安装，只提示 |
+| `--yes` / `-y` | 自动安装时不询问 |
+| 环境变量 `KAMUCL_NO_INSTALL=1` | 任何脚本都不安装，只提示 |
+| 环境变量 `KAMUCL_YES=1` | 任何脚本都不询问，直接装 |
+
+> 兼容性说明：勾号/叉号符号在 GBK 控制台（`chcp 936`）下会触发
+> `UnicodeEncodeError`，所以 env_check 会先把 stdout 切到 UTF-8，
+> 切不动就自动退化成 ASCII 的 `v` / `x`，保证任何代码页都不会崩。
 
 ### 使用前：把本文件夹放进 KAMUCL-runtime
 

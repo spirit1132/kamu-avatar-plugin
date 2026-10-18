@@ -31,11 +31,12 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-try:
-    from PIL import Image
-except ImportError:
-    print('需要 Pillow：pip install Pillow', file=sys.stderr)
-    sys.exit(1)
+# 依赖检查与自动安装统一走 env_check
+import env_check
+
+env_check.require_or_install('PIL', '回归测试需要 Pillow 生成测试皮肤')
+
+from PIL import Image
 
 try:
     import patch_splash_avatar as P
@@ -282,7 +283,7 @@ def test_e2e(asar_path, tmp):
     plugin_dir = os.path.join(root, 'kamu_avatar_plugin')
     os.makedirs(plugin_dir, exist_ok=True)
     for f in ('install.py', 'patch_icons.py', 'patch_splash_avatar.py',
-              'safe_replace.py', 'main.js', 'plugin.json'):
+              'safe_replace.py', 'env_check.py', 'main.js', 'plugin.json'):
         src = os.path.join(HERE, f)
         if os.path.isfile(src):
             shutil.copy2(src, os.path.join(plugin_dir, f))
