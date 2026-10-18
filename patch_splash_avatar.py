@@ -168,6 +168,10 @@ class Asar:
         头部是 Chromium Pickle 结构：
             [u32 4][u32 headerBufLen][u32 payloadSize][u32 jsonLen][json][pad4]
         数据区紧随其后，data_offset = 8 + headerBufLen。
+
+        注意：本方法会**就地修改 self.header** 里的 offset/size/integrity。
+        调用之后同一个 Asar 实例读到的是新布局，不再是原包内容；
+        需要比对前后差异时，必须在调用前先读好快照，或重新构造 Asar。
         """
         # 按 offset 排序，拿到原有文件顺序
         entries = []
@@ -288,7 +292,38 @@ def build_face_module(png_bytes: bytes, template: bytes) -> bytes:
     return pattern.sub(lambda m: m.group(1) + b64, text, count=1).encode("utf-8")
 
 
-# --------------------------------------------------------- 吉祥物皮肤准备
+# ------------------------------------------------------------- 皮肤模型识别
+
+# KAMUCL 的 SkinObject.slim 字段默认 false，手臂 UV 宽度取 slim ? 3 : 4。
+# 吉祥物模块自己从不设置它，所以皮肤是 slim 时必须由我们显式写 modelType/slim。
+#
+# 判定算法与 KAMUCL 的 detectSkinVariant 完全一致：
+#   把皮肤缩放到 64x64，取 (54,20) 起 1x12 的一整列 alpha，
+#   有任何不透明像素 => classic；全透明 => slim。
+#   原理是 classic 手臂背面占 x=54..55 共 4 列，slim 只占 x=54..55 的 3 列，
+#   多出来的那一列在 slim 皮肤里必然留空。
+SLIM_PROBE = (54, 20, 1, 12)
+
+
+def detect_skin_variant(skin: Image.Image):
+    """
+    返回 'slim' / 'classic'。
+
+    与 KAMUCL detectSkinVariant 同算法；取不到数据时返回 None（调用方按 classic 处理）。
+    """
+    try:
+        probe = skin.convert("RGBA")
+        if probe.size != (64, 64):
+            probe = probe.resize((64, 64), Image.NEAREST)
+        x, y, w, h = SLIM_PROBE
+        column = probe.crop((x, y, x + w, y + h))
+        for px in column.getdata():
+            if px[3] != 0:
+                return "classic"
+        return "slim"
+    except Exception:
+        return None
+
 
 def _convert_legacy_skin(skin: Image.Image) -> Image.Image:
     """
@@ -330,8 +365,18 @@ def _convert_legacy_skin(skin: Image.Image) -> Image.Image:
     return canvas
 
 
-def prepare_mascot_skin(path: str) -> bytes:
-    """读入任意图片，产出吉祥物用的 64x64 皮肤 PNG 字节。"""
+def prepare_mascot_skin(path: str, variant: str = None):
+    """
+    读入任意图片，产出吉祥物用的 64x64 皮肤 PNG 字节。
+
+    返回 (png_bytes, variant)，variant 为 'slim' / 'classic'。
+    variant 由调用方传入时直接采用（例如皮肤缓存里已有 variant 字段，
+    比像素探测更可靠）；否则按 KAMUCL 的 detectSkinVariant 探测。
+
+    注意：slim 皮肤不能靠「补全成 classic」来绕过——slim 的手臂贴图只有 3 列宽，
+    硬当 4 列用会把相邻面的像素采进来（手臂多出一条肉色竖纹）。
+    正确做法是保留 slim 布局，并把模型类型一起写进模块。
+    """
     try:
         img = Image.open(path)
         img.load()
@@ -340,9 +385,11 @@ def prepare_mascot_skin(path: str) -> bytes:
 
     img = img.convert("RGBA")
     w, h = img.size
+    legacy = False
     if (w, h) == (64, 32) or (w % 64 == 0 and h == w // 2):
         print("  识别为旧版皮肤 %dx%d，按 KAMUCL 算法转换为 64x64" % (w, h))
         img = _convert_legacy_skin(img)
+        legacy = True
     elif w == h and w % 64 == 0 and h >= 64:
         if (w, h) != (64, 64):
             img = img.resize((64, 64), Image.NEAREST)
@@ -351,18 +398,40 @@ def prepare_mascot_skin(path: str) -> bytes:
         img = img.resize((MASCOT_SKIN_SIZE, MASCOT_SKIN_SIZE), Image.NEAREST)
         print("  非标准皮肤尺寸 %dx%d，整图缩放为 64x64" % (w, h))
 
+    # 模型类型：优先用调用方给的（缓存里的 variant），否则自行探测
+    if variant not in ("slim", "classic"):
+        variant = detect_skin_variant(img)
+        if variant is None:
+            variant = "classic"
+    if legacy:
+        # 旧版皮肤没有手臂以外的 slim 信息，按转换结果探测更准
+        variant = detect_skin_variant(img) or variant
+    print("  皮肤模型：%s（手臂贴图宽度 %d）"
+          % (variant, 3 if variant == "slim" else 4))
+
     buf = io.BytesIO()
     img.save(buf, "PNG", optimize=True)
     data = buf.getvalue()
     print("  生成吉祥物皮肤 PNG：64x64，%d 字节" % len(data))
-    return data
+    return data, variant
 
 
-def build_mascot_module(png_bytes: bytes, template: bytes) -> bytes:
+def build_mascot_module(png_bytes: bytes, template: bytes, variant: str = None) -> bytes:
     """
-    把新皮肤塞进 MascotStage 模块的 skinUrl，保留其余结构。
+    把新皮肤塞进 MascotStage 模块的 skinUrl，并把模型类型一起写进去。
 
     只替换第一个 base64 数据（skinUrl），palmUrl / printUrl 原样保留。
+
+    模型类型处理（slim 与 classic 都要显式声明，不能只处理 slim）：
+      - 在 `player.skin.map = skin;` 之后写一行
+            player.skin.modelType = "slim" | "default";
+        KAMUCL 的 `set modelType(v)` 里 `this.slim = (v === "slim")`，
+        所以 classic 写 "default" 就能把之前打过的 slim 正确覆盖回去，
+        不依赖"精确删掉某一行"这种脆弱做法。
+      - 该赋值会触发 SkinObject.modelListeners，同步手臂 mesh 的 scale.x
+        与 UV 宽度（4 ↔ 3）。
+
+    variant 为 None 时按 classic 处理（等价于 KAMUCL 原本的默认值）。
     """
     text = template.decode("utf-8", errors="replace")
     b64 = base64.b64encode(png_bytes).decode("ascii")
@@ -370,7 +439,29 @@ def build_mascot_module(png_bytes: bytes, template: bytes) -> bytes:
     pattern = re.compile(r'(const skinUrl = "data:image/png;base64,)([A-Za-z0-9+/=]+)')
     if not pattern.search(text):
         raise SystemExit("模板里找不到 skinUrl 皮肤数据，asar 结构可能已变化")
-    return pattern.sub(lambda m: m.group(1) + b64, text, count=1).encode("utf-8")
+    text = pattern.sub(lambda m: m.group(1) + b64, text, count=1)
+
+    want = "slim" if variant == "slim" else "default"
+    decl = 'player.skin.modelType = "%s";' % want
+
+    # 已存在声明：就地替换成目标值（幂等，可 slim <-> classic 来回切）
+    existing = re.compile(
+        r'player\.skin\.modelType\s*=\s*"(?:slim|default)"\s*;')
+    if existing.search(text):
+        text = existing.sub(decl, text, count=1)
+        return text.encode("utf-8")
+
+    marker = re.compile(r'(\n[ \t]*)player\.skin\.map\s*=\s*skin\s*;')
+    m = marker.search(text)
+    if not m:
+        raise SystemExit(
+            "模板里找不到 `player.skin.map = skin;`，无法写入模型类型。\n"
+            "  KAMUCL 结构可能已变化，请检查 MascotStage 模块。")
+
+    # 沿用原文的缩进与换行风格（原包是 LF，json.dumps 不改动模块内容）
+    indent = m.group(1)
+    text = (text[:m.end()] + indent + decl + text[m.end():])
+    return text.encode("utf-8")
 
 
 # ----------------------------------------------------------------- 主流程
@@ -416,6 +507,18 @@ def find_asar(explicit=None, kamu_dir=None):
 
 
 
+def _declared_variant(text: str) -> str:
+    """
+    读出模块里声明的模型类型。
+
+    未声明时按 KAMUCL 的默认值算 classic（SkinObject.slim 初值为 false）。
+    """
+    m = re.search(r'player\.skin\.modelType\s*=\s*"(slim|default)"', text)
+    if not m:
+        return "classic"
+    return "slim" if m.group(1) == "slim" else "classic"
+
+
 def _describe_png(data, rel, label):
     """打印模块内第一个内嵌 PNG 的信息。"""
     text = data.decode("utf-8", errors="replace")
@@ -431,6 +534,18 @@ def _describe_png(data, rel, label):
             pass
     print("  %s（%s）" % (rel, label))
     print("    模块 %d 字节 | 内嵌 PNG %d 字节 | %s" % (len(data), png_len, dims))
+
+    # 吉祥物模块额外报告皮肤模型类型
+    if label == "吉祥物皮肤" and m:
+        try:
+            skin = Image.open(io.BytesIO(base64.b64decode(m.group(1))))
+            detected = detect_skin_variant(skin) or "?"
+            declared = _declared_variant(text)
+            flag = "" if detected == declared else "  ← 不一致（手臂会错位）"
+            print("    皮肤模型：贴图=%s | 模块声明=%s%s"
+                  % (detected, declared, flag))
+        except Exception:
+            pass
 
 
 def do_list(asar):
@@ -475,10 +590,10 @@ def do_patch(asar, skin_path, dry_run=False, do_splash=True, do_mascot=True):
         if not mascots:
             raise SystemExit("未找到 MascotStage 模块，无法替换吉祥物皮肤")
         print("目标模块：%s" % ", ".join(mascots))
-        png = prepare_mascot_skin(skin_path)
+        mskin, variant = prepare_mascot_skin(skin_path)
         for rel in mascots:
             template = asar.read(rel)
-            module = build_mascot_module(png, template)
+            module = build_mascot_module(mskin, template, variant)
             print("  %s：%d -> %d 字节" % (rel, len(template), len(module)))
             replacements[rel] = module
         done.extend(mascots)

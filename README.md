@@ -157,6 +157,58 @@ python patch_splash_avatar.py --only-mascot --skin my_skin.png    # 只换吉祥
 > 转换成 64×64（镜像补全四肢背面、清理帽子叠加层），转换逻辑与原版一致。
 > 模块里另外两个 15×15 的手掌印反馈小图（palm/print）保持原样不动。
 
+#### slim / classic 双模型适配
+
+skins 有 **classic（4 宽手臂）** 和 **slim（3 宽手臂）** 两种布局，两者的手臂贴图
+区域宽度不同，不能混用。
+
+KAMUCL 的吉祥物模块**自己从不设置模型类型**（`SkinObject.slim` 默认 `false`，
+构造末尾固定执行 `this.modelType = "default"`），而它的皮肤预览页
+（`index-*.js`）却是按 `detectSkinVariant()` 动态设置的——**吉祥物这里漏了那一步**。
+所以工具会把类型显式写进模块，slim 和 classic **两种都写**：
+
+```js
+player = new PreviewPlayer();
+player.skin.map = skin;
+player.skin.modelType = "slim";     // slim 皮肤
+player.skin.modelType = "default";  // classic 皮肤
+```
+
+`set modelType(v)` 内部是 `this.slim = (v === "slim")` 再跑一遍
+`modelListeners`，同步手臂 mesh 的 `scale.x`（4 ↔ 3）、UV 宽度和 pivot 偏移。
+所以：
+
+- **slim**：不写就退化成 classic，手臂多采 x=47 那一列（相邻面），表现为竖向色带
+- **classic**：显式写 `"default"` 才能正确覆盖之前打过的 slim，不依赖"精确删行"
+- 两种写法都**幂等**，可以 slim ⇄ classic 反复切换，模块里始终只有一条声明
+
+类型判定用 KAMUCL 的 `detectSkinVariant` 同款算法：取 `(54,20)` 起 1×12 的
+一整列 alpha，有彩色即 classic、全透明即 slim。若皮肤来自 KAMUCL 缓存，则优先
+采用缓存里的 `variant` 字段（更可靠）。用 `--list` 可以核对两者是否一致：
+
+```
+吉祥物皮肤：553 字节，64x64
+  └ 皮肤模型：贴图=slim | 模块声明=slim
+```
+
+不一致时会直接标出来：
+
+```
+  └ 皮肤模型：贴图=slim | 模块声明=classic  ← 不一致，手臂会错位
+```
+
+`--skin` 指定任意图片时，非皮肤尺寸会整图缩放为 64×64 并按探测结果处理。
+
+#### 回归测试
+
+```cmd
+python test_mascot_variant.py
+python test_mascot_variant.py --asar "KAMUCL-runtime\<版本>\resources\app.asar"
+```
+
+第二种会在真实 asar 的副本上跑完整流程（40 项断言），覆盖探测算法、双向切换、
+幂等、`node --check` 语法、以及「只改动目标模块」。
+
 ### 查看当前状态
 
 ```cmd
@@ -409,6 +461,7 @@ kamu_avatar_plugin\
 ├─ patch_splash_avatar.py       启动动画头像 + 吉祥物皮肤补丁工具
 ├─ patch_icons.py               程序图标补丁工具
 ├─ safe_replace.py              安全替换（先验证再替换，无备份）
+├─ test_mascot_variant.py       slim / classic 模型类型回归测试
 ├─ LICENSE                      MIT 许可证
 ├─ .gitignore
 └─ README.md                    本文件
@@ -417,7 +470,7 @@ kamu_avatar_plugin\
 ### 发布/分发时的最小文件集
 
 只发两个 `.bat` **不能用**（它们只是入口，实际执行的是 `install.py`）。
-必须一起打包这 8 个文件（约 90 KB），且**必须放在同一目录**：
+必须一起打包这 7 个文件（约 90 KB），且**必须放在同一目录**：
 
 ```
 一键美化.bat
@@ -428,6 +481,8 @@ patch_splash_avatar.py
 main.js
 plugin.json
 ```
+
+> `test_mascot_variant.py` 只是开发期回归测试，分发时可以不带上。
 
 ### 运行环境要求
 

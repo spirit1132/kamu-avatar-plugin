@@ -317,13 +317,17 @@ def _cleanup_tmp_files(root):
 
 
 
-def step_splash_avatar(asar, skin_path, dry=False, do_splash=True, do_mascot=True):
+def step_splash_avatar(asar, skin_path, dry=False, do_splash=True, do_mascot=True,
+                       variant=None):
     """
     替换 asar 内的皮肤资源（先验证再替换，原文件在验证通过前不会被改动）：
       ① 启动动画头像（splash-face 模块，256x256 头部）
       ② 吉祥物皮肤（MascotStage 模块，左上角头像点开的 3D 彩蛋）
 
     两者在同一个 app.asar 里，合并成一次写入。
+
+    variant: 'slim' / 'classic' / None。来自 KAMUCL 皮肤缓存的 variant 字段，
+             比像素探测更可靠；None 时由 patch_splash_avatar 自行探测。
     """
     head('① 启动动画头像 / 吉祥物皮肤')
     if not asar:
@@ -345,9 +349,12 @@ def step_splash_avatar(asar, skin_path, dry=False, do_splash=True, do_mascot=Tru
             for rel in faces:
                 repl[rel] = patch_splash_avatar.build_face_module(png, a.read(rel))
         if mascots:
-            mskin = patch_splash_avatar.prepare_mascot_skin(skin_path)
+            mskin, mvariant = patch_splash_avatar.prepare_mascot_skin(skin_path, variant)
             for rel in mascots:
-                repl[rel] = patch_splash_avatar.build_mascot_module(mskin, a.read(rel))
+                repl[rel] = patch_splash_avatar.build_mascot_module(
+                    mskin, a.read(rel), mvariant)
+                if mvariant == 'slim':
+                    dim('已写入 slim 模型类型（手臂按 3 列宽渲染）')
 
         if dry:
             dim('[试运行] 将替换 %s' % ', '.join(sorted(repl)))
@@ -521,6 +528,16 @@ def cmd_list(root, asar, userdata):
                     raw = base64.b64decode(m.group(1))
                     dim('吉祥物皮肤：%d 字节，%dx%d' %
                         (len(raw), *struct.unpack('>II', raw[16:24])))
+                    try:
+                        from PIL import Image as _Image
+                        detected = patch_splash_avatar.detect_skin_variant(
+                            _Image.open(io.BytesIO(raw))) or '?'
+                        declared = patch_splash_avatar._declared_variant(txt)
+                        flag = '' if detected == declared else '  ← 不一致，手臂会错位'
+                        dim('  └ 皮肤模型：贴图=%s | 模块声明=%s%s'
+                            % (detected, declared, flag))
+                    except Exception:
+                        pass
         except Exception as e:
             warn('读取 asar 失败：%s' % e)
 
@@ -603,6 +620,7 @@ def main():
     # 皮肤来源
     skin_path = args.skin
     tmp_skin = None
+    skin_variant = None
     if not skin_path:
         got = extract_skin_from_cache(userdata)
         if got:
@@ -610,6 +628,7 @@ def main():
             tmp_skin = os.path.join(HERE, '.skin-from-cache.png')
             open(tmp_skin, 'wb').write(raw)
             skin_path = tmp_skin
+            skin_variant = variant
             ok('已从 KAMUCL 缓存导出账号皮肤：%s（%s 模型，%d 字节）'
                % (username, variant, len(raw)))
         else:
@@ -636,7 +655,8 @@ def main():
         if not args.no_splash or not args.no_mascot:
             step_splash_avatar(asar, skin_path, args.dry_run,
                                do_splash=not args.no_splash,
-                               do_mascot=not args.no_mascot)
+                               do_mascot=not args.no_mascot,
+                               variant=skin_variant)
         if not args.no_icon:
             step_icons(root, icon_path, args.dry_run)
         if not args.no_plugin:
