@@ -45,14 +45,38 @@ REQUIREMENTS = [
     ('Pillow', 'PIL', True, '图像处理（皮肤裁切、图标生成）'),
 ]
 
-# 安装失败时依次尝试的额外源（仅在默认源失败后使用）
+# 清华镜像（国内首选，速度快）
+TSINGHUA = 'https://pypi.tuna.tsinghua.edu.cn/simple'
+ALIYUN = 'https://mirrors.aliyun.com/pypi/simple/'
+OFFICIAL = None  # 表示不传 -i，走 pip 自身配置
+
+# 镜像优先级：清华 → 阿里云 → 官方源（兜底）
+# 之所以把清华放最前：内置 pip 15 秒连接超时，默认源在国内经常挂着不动，
+# 先试默认源会让用户误以为卡死。详见 install_package()。
 MIRRORS = [
-    ('官方源', None),
-    ('清华镜像', 'https://pypi.tuna.tsinghua.edu.cn/simple'),
-    ('阿里云镜像', 'https://mirrors.aliyun.com/pypi/simple/'),
+    ('清华镜像', TSINGHUA),
+    ('阿里云镜像', ALIYUN),
+    ('官方源', OFFICIAL),
 ]
 
+# 单次 pip 尝试的连接/读取超时（秒）。
+# 镜像源通常 4~10 秒能下完 7MB，给 60 秒足够；超时就换下一个源，
+# 而不是像内置默认那样干等。
+PIP_TIMEOUT = 60
+PIP_RETRIES = 1
+
 MIN_PYTHON = (3, 6)
+
+# Python 官方安装包（国内访问 python.org 通常很慢，镜像优先）
+PYTHON_INSTALLER_URLS = [
+    ('华为镜像', 'https://mirrors.huaweicloud.com/python/{ver}/python-{ver}-amd64.exe'),
+    ('官方源', 'https://www.python.org/ftp/python/{ver}/python-{ver}-amd64.exe'),
+]
+
+# 自动安装 Python 时使用的版本。选 3.13 是因为：
+#   · 稳定、有官方 Windows 安装包
+#   · Pillow 有对应 cp313 wheel，不需要本地编译
+PYTHON_DEFAULT_VERSION = '3.13.11'
 
 C_OK = '\033[92m'
 C_WARN = '\033[93m'
@@ -166,6 +190,173 @@ def survey():
     return out
 
 
+# ------------------------------------------------------------ Python 自身
+
+def _download(url, dest, timeout=300):
+    """
+    用标准库下载文件（不依赖 requests）。
+
+    返回 (是否成功, 说明)。边下边报进度，避免用户以为卡死。
+    """
+    import urllib.request
+    import urllib.error
+
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'kamu-env-check'})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            total = int(resp.headers.get('Content-Length') or 0)
+            done = 0
+            step = 0
+            with open(dest, 'wb') as fh:
+                while True:
+                    chunk = resp.read(256 * 1024)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    done += len(chunk)
+                    # 每 10% 报一次，避免刷屏
+                    if total:
+                        pct = done * 100 // total
+                        if pct >= step + 10:
+                            step = pct - pct % 10
+                            print('      %d%%  (%.1f / %.1f MB)'
+                                  % (step, done / 1048576, total / 1048576))
+        return True, ''
+    except urllib.error.HTTPError as exc:
+        return False, 'HTTP %s' % exc.code
+    except Exception as exc:
+        return False, str(exc)
+
+
+def find_python_exe():
+    """
+    在 PATH 里找一个**真正能执行**的 python.exe。
+
+    不能只信 `where python`：Windows 的 Store 占位程序也是 0 字节的
+    python.exe，会被 where 找到，但执行时零输出、退出码 9009。
+    这里用实际执行来判定。
+    """
+    import shutil as _shutil
+
+    candidates = []
+    for name in ('python', 'python3', 'py'):
+        p = _shutil.which(name)
+        if p and p not in candidates:
+            candidates.append(p)
+
+    # Windows 上再翻一遍 PATH，跳过 WindowsApps 占位程序
+    if os.name == 'nt':
+        for d in (os.environ.get('PATH') or '').split(os.pathsep):
+            if not d or 'WindowsApps' in d:
+                continue
+            for exe in ('python.exe',):
+                p = os.path.join(d, exe)
+                if os.path.isfile(p) and p not in candidates:
+                    candidates.append(p)
+
+    for p in candidates:
+        try:
+            r = subprocess.run(
+                [p, '-c', 'import sys;print(sys.version.split()[0])'],
+                capture_output=True, timeout=30,
+                encoding='utf-8', errors='replace')
+        except Exception:
+            continue
+        out = (r.stdout or '').strip()
+        # 必须真的打印出版本号，才算可用
+        if r.returncode == 0 and out and out[0].isdigit():
+            return p, out
+    return None, None
+
+
+def install_python(version=None, quiet=False):
+    """
+    下载并静默安装 Python（per-user，自动加入 PATH）。
+
+    安装参数：
+        /quiet                  静默
+        InstallAllUsers=0       仅当前用户，不需要管理员
+        PrependPath=1           自动加到用户 PATH
+        Include_pip=1           带 pip
+        Include_test=0          不带测试套件（省空间）
+
+    返回 (是否成功, 说明)
+    """
+    version = version or PYTHON_DEFAULT_VERSION
+    import tempfile
+
+    tmpdir = tempfile.mkdtemp(prefix='kamu_py_')
+    exe = os.path.join(tmpdir, 'python-%s-amd64.exe' % version)
+
+    last_err = ''
+    for label, tpl in PYTHON_INSTALLER_URLS:
+        url = tpl.format(ver=version)
+        if not quiet:
+            dim('下载 Python %s（%s）...' % (version, label))
+        good, why = _download(url, exe)
+        if not good:
+            last_err = '%s：%s' % (label, why)
+            if not quiet:
+                dim('  失败：%s' % why)
+            continue
+
+        if not quiet:
+            ok('下载完成：%.1f MB' % (os.path.getsize(exe) / 1048576))
+            dim('正在静默安装（可能需要 1-2 分钟，请勿关闭窗口）...')
+
+        cmd = [exe, '/quiet',
+               'InstallAllUsers=0', 'PrependPath=1', 'Include_pip=1',
+               'Include_test=0', 'Include_launcher=1',
+               'AssociateFiles=0', 'Shortcuts=0']
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=900,
+                               encoding='utf-8', errors='replace')
+        except Exception as exc:
+            last_err = '安装程序执行异常：%s' % exc
+            continue
+
+        if r.returncode not in (0, 3010):
+            last_err = '安装程序返回 %s' % r.returncode
+            continue
+
+        # 安装后刷新 PATH 再找一次
+        _refresh_path()
+        p, ver = find_python_exe()
+        if p:
+            return True, '%s（%s）' % (p, ver)
+        last_err = '安装完成，但 PATH 里仍未找到可执行的 python'
+
+    try:
+        import shutil as _sh
+        _sh.rmtree(tmpdir, ignore_errors=True)
+    except Exception:
+        pass
+    return False, last_err
+
+
+def _refresh_path():
+    """把用户/系统 PATH 重新读进当前进程（安装器改的是注册表）。"""
+    if os.name != 'nt':
+        return
+    try:
+        import winreg
+        parts = []
+        for root, key in ((winreg.HKEY_CURRENT_USER,
+                           r'Environment'),
+                          (winreg.HKEY_LOCAL_MACHINE,
+                           r'SYSTEM\CurrentControlSet\Control\Session Manager\Environment')):
+            try:
+                with winreg.OpenKey(root, key) as k:
+                    v, _ = winreg.QueryValueEx(k, 'Path')
+                    parts.append(v)
+            except Exception:
+                pass
+        if parts:
+            os.environ['PATH'] = os.pathsep.join(parts + [os.environ.get('PATH', '')])
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------- pip 调用
 
 def _pip_cmd(args):
@@ -254,9 +445,27 @@ def ensure_pip(quiet=False):
     return False, (detail[-1] if detail else 'ensurepip 未能修复 pip')
 
 
-def install_package(pkg, quiet=False):
+def _mirror_args(url):
+    """把镜像地址转成 pip 参数；url 为 None 时不加 -i（用 pip 自身配置）。"""
+    if not url:
+        return []
+    host = url.split('//', 1)[-1].split('/', 1)[0]
+    return ['-i', url, '--trusted-host', host]
+
+
+def install_package(pkg, quiet=False, index_url=None):
     """
-    尝试安装一个包。依次尝试：默认源 → --user → 各镜像源。
+    安装一个包。默认**优先走清华镜像**，失败再依次退到阿里云、官方源。
+
+    每个源还会再试一次 `--user`（应对全局站点包无写权限）。
+
+    为什么镜像优先而不是官方源优先：
+      pip 内置连接超时 15 秒、读超时更长，遇到被墙/拥塞的 pypi.org 会
+      长时间无进度条地挂着，用户以为卡死。国内实测同一包：
+          默认源 63 秒  /  清华镜像 4 秒
+      所以先镜像、再兜底官方源是更合理的默认。
+
+    index_url 显式指定时只试那一个（供 --index 参数使用）。
 
     返回 (是否成功, 失败原因)
     """
@@ -265,34 +474,37 @@ def install_package(pkg, quiet=False):
     if not has_pip:
         return False, 'pip 不可用（%s）' % why
 
+    import_name = REQUIREMENTS_NAME_TO_IMPORT.get(pkg, pkg)
+
+    if index_url:
+        sources = [('指定源', index_url)]
+    else:
+        sources = list(MIRRORS)
+
     attempts = []
-
-    # 1) 常规安装
-    attempts.append(('默认源', _pip_cmd(['install', '--upgrade', pkg])))
-    # 2) 用户目录安装（全局站点包无写权限时）
-    attempts.append(('--user', _pip_cmd(['install', '--upgrade', '--user', pkg])))
-
-    # 3) 镜像源（默认源慢/不可达时）
-    for label, url in MIRRORS[1:]:
-        attempts.append((label,
-                         _pip_cmd(['install', '--upgrade', '--user',
-                                   '-i', url, pkg,
-                                   '--trusted-host',
-                                   url.split('//', 1)[-1].split('/', 1)[0]])))
+    for label, url in sources:
+        base = ['install', '--upgrade', '--timeout', str(PIP_TIMEOUT),
+                '--retries', str(PIP_RETRIES)] + _mirror_args(url)
+        attempts.append(('%s' % label, _pip_cmd(base + [pkg])))
+        # 同一源再用 --user 试一次（全局站点包只读时）
+        attempts.append(('%s（--user）' % label,
+                         _pip_cmd(base + ['--user', pkg])))
 
     last_err = ''
     for label, cmd in attempts:
         if not quiet:
-            dim('尝试：%s（%s）' % (label, ' '.join(cmd[3:5])))
-        success, output = _run(cmd)
+            dim('尝试：%s' % label)
+        success, output = _run(cmd, timeout=PIP_TIMEOUT + 60)
         if success:
             # pip 返回 0 仍要复查 import，防止装到了别的解释器
-            if module_available(REQUIREMENTS_NAME_TO_IMPORT.get(pkg, pkg)):
+            if module_available(import_name):
                 return True, ''
             last_err = 'pip 报告成功，但 import 仍失败（可能装到了其它解释器）'
             continue
-        last_err = output.strip().splitlines()[-1] if output.strip() else '未知错误'
-        # 离线 / 网络类错误重试镜像没意义，但保留尝试也无害
+        last_err = (output.strip().splitlines()[-1] if output.strip()
+                    else '未知错误')
+        if not quiet:
+            dim('  失败：%s' % last_err[:100])
     return False, last_err
 
 
@@ -302,7 +514,12 @@ REQUIREMENTS_NAME_TO_IMPORT = {p: i for p, i, _, _ in REQUIREMENTS}
 # ------------------------------------------------------------------ 交互
 
 def ask(prompt, default=True):
-    """简单 y/n 询问；非交互环境直接返回默认值。"""
+    """
+    简单 y/n 询问。
+
+    非交互环境（管道、双击 bat、CI）直接返回 default，不阻塞。
+    只有用户**明确**回答 n / no 才算拒绝。
+    """
     if not sys.stdin or not sys.stdin.isatty():
         return default
     suffix = ' [Y/n] ' if default else ' [y/N] '
@@ -310,7 +527,8 @@ def ask(prompt, default=True):
         ans = input(prompt + suffix).strip().lower()
     except (EOFError, KeyboardInterrupt):
         print()
-        return False
+        # Ctrl+C 视为取消；EOF（管道读空）视为采用默认值
+        return default if default else False
     if not ans:
         return default
     return ans in ('y', 'yes', '是', '好')
@@ -500,6 +718,11 @@ def main():
     ap.add_argument('--list', action='store_true', help='只查看依赖状态')
     ap.add_argument('--yes', '-y', action='store_true', help='不询问，直接安装')
     ap.add_argument('--no-install', action='store_true', help='只检查，不自动安装')
+    ap.add_argument('--install-python', action='store_true',
+                    help='Python 不可用时自动下载安装（镜像优先）')
+    ap.add_argument('--python-version', default=PYTHON_DEFAULT_VERSION,
+                    help='要安装的 Python 版本（默认 %s）'
+                         % PYTHON_DEFAULT_VERSION)
     args = ap.parse_args()
 
     if args.list:
@@ -509,6 +732,33 @@ def main():
     print()
     dim('正在检查运行环境 ...')
     print()
+
+    # 本脚本自身就跑在 Python 里，所以走到这里说明解释器可用；
+    # --install-python 是给「bat 找不到 python、用别的方式启动本脚本」准备的。
+    if args.install_python:
+        p, ver = find_python_exe()
+        if p:
+            ok('已找到 Python %s（%s）' % (ver, p))
+        else:
+            err('未找到可用的 Python')
+            if args.no_install:
+                _print_python_manual_hint(args.python_version)
+                return 1
+            if not args.yes and not ask('是否现在下载安装 Python %s？'
+                                        % args.python_version):
+                _print_python_manual_hint(args.python_version)
+                return 1
+            print()
+            good, info = install_python(args.python_version)
+            if good:
+                ok('Python 安装成功：%s' % info)
+                dim('如果当前窗口仍找不到 python，请重开一个新的 cmd 窗口')
+            else:
+                err('Python 安装失败：%s' % info)
+                _print_python_manual_hint(args.python_version)
+                return 1
+        print()
+
     good = ensure_requirements(
         auto_install=not args.no_install,
         interactive=not args.yes,
@@ -519,6 +769,24 @@ def main():
         return 0
     err('环境不完整')
     return 1
+
+
+def _print_python_manual_hint(version=None):
+    """Python 缺失时的手动安装指引。"""
+    version = version or PYTHON_DEFAULT_VERSION
+    print()
+    err('请手动安装 Python，任选一种：')
+    dim('【方式一】命令行（推荐，自动静默安装 + 加入 PATH）')
+    for label, tpl in PYTHON_INSTALLER_URLS:
+        dim('  %s：%s' % (label, tpl.format(ver=version)))
+    dim('  下载后双击安装，务必勾选 "Add python.exe to PATH"')
+    print()
+    dim('【方式二】官方下载页')
+    dim('  https://www.python.org/downloads/')
+    print()
+    dim('【方式三】如果只装了 Microsoft Store 的占位程序')
+    dim('  设置 → 应用 → 高级应用设置 → 应用执行别名')
+    dim('  → 关闭 python.exe / python3.exe 两个开关')
 
 
 if __name__ == '__main__':

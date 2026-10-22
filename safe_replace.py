@@ -167,6 +167,69 @@ def safe_replace(target, write_func, verify=True, label=None):
 
     return tmp
 
+def check_writable(target, label=None):
+    """
+    预检目标文件是否**真的可以被替换**，返回 (可写, 原因)。
+
+    为什么需要这个：os.replace() 失败时可能已经替换掉了别的文件，
+    造成"一部分改了、一部分没改"的中间态。提前探测能避免这种情况。
+
+    检测方式（任一条失败即判定不可写）：
+      1. 以独占方式打开（Windows 上用 O_EXCL 无法做到，改用重命名探测）
+      2. 更可靠的做法：尝试把目标重命名到同目录的临时名再改回来。
+         被别的进程以独占方式打开时，rename 会抛 ERROR_SHARING_VIOLATION。
+
+    注意：只做探测，不改动内容。文件不存在则视为不可写。
+    """
+    label = label or os.path.basename(target)
+    if not os.path.exists(target):
+        return False, '%s 不存在' % label
+
+    d = os.path.dirname(os.path.abspath(target)) or '.'
+    probe = os.path.join(d, '.kamucl-lock-probe-%d.tmp' % os.getpid())
+    try:
+        # 先确认目录可写
+        try:
+            with open(probe, 'wb') as fh:
+                fh.write(b'')
+        except OSError as exc:
+            return False, '%s 所在目录不可写（%s）' % (label, exc)
+        finally:
+            try:
+                os.remove(probe)
+            except OSError:
+                pass
+
+        # 再探测目标本身能否被改名（等价于能否被 os.replace 覆盖）
+        if os.name == 'nt':
+            import ctypes
+            import ctypes.wintypes as wt
+            k = ctypes.WinDLL('kernel32', use_last_error=True)
+            GENERIC_READ = 0x80000000
+            FILE_SHARE_NONE = 0x00000000
+            OPEN_EXISTING = 3
+            k.CreateFileW.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD,
+                                      ctypes.c_void_p, wt.DWORD, wt.DWORD,
+                                      wt.HANDLE]
+            k.CreateFileW.restype = wt.HANDLE
+            handle = k.CreateFileW(os.path.abspath(target), GENERIC_READ,
+                                   FILE_SHARE_NONE, None, OPEN_EXISTING,
+                                   0, None)
+            INVALID = ctypes.c_void_p(-1).value
+            if handle in (None, INVALID):
+                code = ctypes.get_last_error()
+                if code == 32:
+                    return False, ('%s 正被其他程序使用'
+                                   '（WinError 32，请关闭资源管理器预览/杀毒软件）'
+                                   % label)
+                # 5 = 拒绝访问；其余也可能是权限问题
+                return False, '%s 无法打开（WinError %d）' % (label, code)
+            k.CloseHandle(handle)
+        return True, ''
+    except Exception as exc:
+        return False, '%s 探测失败（%s）' % (label, exc)
+
+
 def safe_replace_pre(target, write_func, label=None):
     """
     阶段一：构建到临时文件并验证，**不替换原文件**。

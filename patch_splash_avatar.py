@@ -287,16 +287,79 @@ def prepare_avatar(path: str) -> bytes:
     return data
 
 
+# --------------------------------------------------------- 内嵌资源定位
+
+# 打包器在不同 KAMUCL 版本里的压缩程度不同：
+#   1.1.21  const faceUrl = "data:image/png;base64,...";      变量名可读
+#   1.1.48  const U="data:image/png;base64,...";export{U as f}  变量名被 mangle 成单字母
+# 所以不能只认变量名。这里提供两条路径：
+#   ① 优先按已知变量名匹配（最精确，且能保证替换的是正确那个）
+#   ② 失败则按 data URL 出现顺序 + PNG 尺寸校验定位（尺寸对得上才替换）
+DATA_URL_RE = re.compile(r'data:image/png;base64,([A-Za-z0-9+/=]+)')
+
+
+def _png_size(b64_text):
+    """从 base64 编码的 PNG 里读出 (宽, 高)；失败返回 None。"""
+    try:
+        raw = base64.b64decode(b64_text[:512] + "=" * (-len(b64_text[:512]) % 4))
+        # PNG IHDR：8 字节签名 + 4 长度 + 4 类型，之后是大端宽高
+        if raw[:8] != b"\x89PNG\r\n\x1a\n":
+            return None
+        return struct.unpack(">II", raw[16:24])
+    except Exception:
+        return None
+
+
+def _replace_nth_data_url(text, b64, index, expect_size=None):
+    """
+    替换第 index 个（从 0 起）data URL 的 base64 内容。
+
+    expect_size 给定时先校验原图尺寸，不匹配就拒绝替换——
+    避免在结构变化后误把手掌/指纹小图当成皮肤。
+    """
+    matches = list(DATA_URL_RE.finditer(text))
+    if len(matches) <= index:
+        return None
+    m = matches[index]
+    if expect_size is not None:
+        got = _png_size(m.group(1))
+        if got != expect_size:
+            return None
+    return text[:m.start(1)] + b64 + text[m.end(1):]
+
+
 def build_face_module(png_bytes: bytes, template: bytes) -> bytes:
-    """把新 PNG 塞进 splash-face 模块，保留原模块结构。"""
+    """
+    把新 PNG 塞进 splash-face 模块，保留原模块结构。
+
+    该模块只有一个内嵌 PNG（启动动画头像），所以两条路径指向同一处：
+      ① const faceUrl = "data:image/png;base64,..."（1.1.21 等未压缩版本）
+      ② const U="data:image/png;base64,..."（1.1.48 等 mangle 版本）
+    """
     text = template.decode("utf-8", errors="replace")
     b64 = base64.b64encode(png_bytes).decode("ascii")
 
-    # 匹配 const faceUrl = "data:image/png;base64,....";
-    pattern = re.compile(r'(data:image/png;base64,)([A-Za-z0-9+/=]+)')
-    if not pattern.search(text):
-        raise SystemExit("模板里找不到 base64 头像数据，asar 结构可能已变化")
-    return pattern.sub(lambda m: m.group(1) + b64, text, count=1).encode("utf-8")
+    named = re.compile(
+        r'(const\s+faceUrl\s*=\s*"data:image/png;base64,)([A-Za-z0-9+/=]+)')
+    if named.search(text):
+        return named.sub(lambda m: m.group(1) + b64, text, count=1).encode("utf-8")
+
+    # 退回按序号定位：这个模块里只应有 1 个 256x256 的 data URL
+    try:
+        from PIL import Image  # noqa: F401  (仅确认依赖可用)
+        expected = (OUT_SIZE, OUT_SIZE)
+    except Exception:
+        expected = None
+    out = _replace_nth_data_url(text, b64, 0, expected)
+    if out is not None:
+        return out.encode("utf-8")
+
+    # 兜底：不校验尺寸，直接换第一个（模块只有一个 PNG 时安全）
+    out = _replace_nth_data_url(text, b64, 0)
+    if out is not None:
+        return out.encode("utf-8")
+
+    raise SystemExit("模板里找不到 base64 头像数据，asar 结构可能已变化")
 
 
 # ------------------------------------------------------------- 皮肤模型识别
@@ -325,8 +388,10 @@ def detect_skin_variant(skin):
             probe = probe.resize((64, 64), Image.NEAREST)
         x, y, w, h = SLIM_PROBE
         column = probe.crop((x, y, x + w, y + h))
-        for px in column.getdata():
-            if px[3] != 0:
+        # getdata() 在 Pillow 14 会被移除，优先用 tobytes() 直接取 RGBA 字节
+        raw = column.tobytes()
+        for i in range(3, len(raw), 4):
+            if raw[i] != 0:          # 每 4 字节的最后一个就是 alpha
                 return "classic"
         return "slim"
     except Exception:
@@ -428,51 +493,92 @@ def prepare_mascot_skin(path: str, variant: str = None):
     return data, variant
 
 
+# 吉祥物模块里 skin 赋值语句的通用形态。压缩前后：
+#   1.1.21  player.skin.map = skin;
+#   1.1.48  h.skin.map=b,
+# 共同点是 `<对象标识符>.skin.map` 后面跟赋值。用捕获组接住前缀，才能在后面插入声明。
+SKIN_MAP_RE = re.compile(
+    r'([A-Za-z_$][\w$]*)\.skin\.map\s*=\s*[A-Za-z_$][\w$]*')
+
+# 已写入的模型类型声明，形如 `XX.skin.modelType="slim"` / `=.skin.modelType = "default";`
+MODEL_DECL_RE = re.compile(
+    r'([A-Za-z_$][\w$]*)\.skin\.modelType\s*=\s*"(?:slim|default)"\s*;?')
+
+
 def build_mascot_module(png_bytes: bytes, template: bytes, variant: str = None) -> bytes:
     """
-    把新皮肤塞进 MascotStage 模块的 skinUrl，并把模型类型一起写进去。
+    把新皮肤塞进 MascotStage 模块，并把模型类型一起写进去。
 
-    只替换第一个 base64 数据（skinUrl），palmUrl / printUrl 原样保留。
+    只替换第一个 64x64 的 data URL（皮肤），palm/print 两张 15x15 小图原样保留。
 
-    模型类型处理（slim 与 classic 都要显式声明，不能只处理 slim）：
-      - 在 `player.skin.map = skin;` 之后写一行
-            player.skin.modelType = "slim" | "default";
-        KAMUCL 的 `set modelType(v)` 里 `this.slim = (v === "slim")`，
-        所以 classic 写 "default" 就能把之前打过的 slim 正确覆盖回去，
-        不依赖"精确删掉某一行"这种脆弱做法。
-      - 该赋值会触发 SkinObject.modelListeners，同步手臂 mesh 的 scale.x
-        与 UV 宽度（4 ↔ 3）。
+    兼容不同压缩程度：
+      · 皮肤定位
+          ① const skinUrl = "data:image/png;base64,..."   （1.1.21 等可读版本）
+          ② const La="data:image/png;base64,..."          （1.1.48 等 mangle 版本）
+        两路都不中时，按「第 1 个 data URL 且尺寸为 64x64」定位。
+        尺寸校验是关键：模块里另有 2 个 15x15 小图，靠尺寸区分，绝不误伤。
+
+      · 模型类型声明
+        找到 `<x>.skin.map=<y>` 之后插入 `<x>.skin.modelType="slim"|"default";`。
+        1.1.48 的压缩版本里 SkinObject 的 setter 依然存在：
+            get modelType(){return this.slim?"slim":"default"}
+            set modelType(e){this.slim=e==="slim",this.modelListeners.forEach(t=>t())}
+        所以写入同样生效，会把手臂 mesh 的 scale.x / UV 宽度在 4 与 3 之间切换。
 
     variant 为 None 时按 classic 处理（等价于 KAMUCL 原本的默认值）。
     """
     text = template.decode("utf-8", errors="replace")
     b64 = base64.b64encode(png_bytes).decode("ascii")
 
-    pattern = re.compile(r'(const skinUrl = "data:image/png;base64,)([A-Za-z0-9+/=]+)')
-    if not pattern.search(text):
-        raise SystemExit("模板里找不到 skinUrl 皮肤数据，asar 结构可能已变化")
-    text = pattern.sub(lambda m: m.group(1) + b64, text, count=1)
+    # ---- 1. 替换皮肤数据 ----
+    named = re.compile(
+        r'(const\s+skinUrl\s*=\s*"data:image/png;base64,)([A-Za-z0-9+/=]+)')
+    if named.search(text):
+        text = named.sub(lambda m: m.group(1) + b64, text, count=1)
+    else:
+        # 按序号 + 尺寸定位：第 0 个，且必须是 64x64
+        replaced = _replace_nth_data_url(
+            text, b64, 0, (MASCOT_SKIN_SIZE, MASCOT_SKIN_SIZE))
+        if replaced is not None:
+            text = replaced
+        else:
+            # 再退一步：找第一个「尺寸正好 64x64」的 data URL，不限定序号
+            hit = None
+            for i, m in enumerate(DATA_URL_RE.finditer(text)):
+                if _png_size(m.group(1)) == (MASCOT_SKIN_SIZE, MASCOT_SKIN_SIZE):
+                    hit = i
+                    break
+            if hit is None:
+                raise SystemExit(
+                    "模板里找不到 64x64 的皮肤数据（skinUrl）。\n"
+                    "  KAMUCL 结构可能已变化，请检查 MascotStage 模块。")
+            text = _replace_nth_data_url(text, b64, hit,
+                                         (MASCOT_SKIN_SIZE, MASCOT_SKIN_SIZE))
 
+    # ---- 2. 写入模型类型 ----
     want = "slim" if variant == "slim" else "default"
-    decl = 'player.skin.modelType = "%s";' % want
 
-    # 已存在声明：就地替换成目标值（幂等，可 slim <-> classic 来回切）
-    existing = re.compile(
-        r'player\.skin\.modelType\s*=\s*"(?:slim|default)"\s*;')
-    if existing.search(text):
-        text = existing.sub(decl, text, count=1)
+    # 已存在声明：就地改值（幂等，可 slim <-> classic 来回切）
+    existing = MODEL_DECL_RE.search(text)
+    if existing:
+        decl = '%s.skin.modelType="%s";' % (existing.group(1), want)
+        text = text[:existing.start()] + decl + text[existing.end():]
         return text.encode("utf-8")
 
-    marker = re.compile(r'(\n[ \t]*)player\.skin\.map\s*=\s*skin\s*;')
-    m = marker.search(text)
+    m = SKIN_MAP_RE.search(text)
     if not m:
         raise SystemExit(
-            "模板里找不到 `player.skin.map = skin;`，无法写入模型类型。\n"
+            "模板里找不到 `<x>.skin.map=<y>` 赋值语句，无法写入模型类型。\n"
             "  KAMUCL 结构可能已变化，请检查 MascotStage 模块。")
 
-    # 沿用原文的缩进与换行风格（原包是 LF，json.dumps 不改动模块内容）
-    indent = m.group(1)
-    text = (text[:m.end()] + indent + decl + text[m.end():])
+    obj = m.group(1)
+    # 原语句结尾可能是 `;` 或 `,`（压缩版用逗号串联声明），插在其后即可
+    end = m.end()
+    tail = text[end:end + 1]
+    if tail in (";", ","):
+        end += 1
+    decl = '%s.skin.modelType="%s";' % (obj, want)
+    text = text[:end] + decl + text[end:]
     return text.encode("utf-8")
 
 
@@ -523,23 +629,54 @@ def _declared_variant(text: str) -> str:
     """
     读出模块里声明的模型类型。
 
+    兼容两种写法：
+        player.skin.modelType = "slim";      （1.1.21 等可读版本）
+        h.skin.modelType="slim";             （1.1.48 等 mangle 版本）
+
     未声明时按 KAMUCL 的默认值算 classic（SkinObject.slim 初值为 false）。
     """
-    m = re.search(r'player\.skin\.modelType\s*=\s*"(slim|default)"', text)
+    m = MODEL_DECL_RE.search(text)
     if not m:
         return "classic"
-    return "slim" if m.group(1) == "slim" else "classic"
+    return "slim" if '"slim"' in m.group(0) else "classic"
+
+
+def _skin_data_url(text: str):
+    """
+    取出吉祥物模块里的皮肤 base64 文本（用于 --list 显示）。
+
+    优先认 skinUrl 变量名，退回「第一个 64x64 的 data URL」。
+    """
+    m = re.search(r'const\s+skinUrl\s*=\s*"data:image/png;base64,([A-Za-z0-9+/=]+)',
+                  text)
+    if m:
+        return m.group(1)
+    for dm in DATA_URL_RE.finditer(text):
+        if _png_size(dm.group(1)) == (MASCOT_SKIN_SIZE, MASCOT_SKIN_SIZE):
+            return dm.group(1)
+    return None
 
 
 def _describe_png(data, rel, label):
-    """打印模块内第一个内嵌 PNG 的信息。"""
+    """打印模块内目标 PNG 的信息（头像取第 1 个，吉祥物按尺寸取 64x64 那个）。"""
     text = data.decode("utf-8", errors="replace")
-    m = re.search(r'base64,([A-Za-z0-9+/=]+)', text)
+
+    b64_text = None
+    if label == "吉祥物皮肤":
+        b64_text = _skin_data_url(text)
+    else:
+        m = re.search(r'const\s+faceUrl\s*=\s*"data:image/png;base64,([A-Za-z0-9+/=]+)',
+                      text)
+        b64_text = m.group(1) if m else None
+        if b64_text is None:
+            first = DATA_URL_RE.search(text)
+            b64_text = first.group(1) if first else None
+
     png_len = 0
     dims = "?"
-    if m:
+    if b64_text:
         try:
-            raw = base64.b64decode(m.group(1))
+            raw = base64.b64decode(b64_text)
             png_len = len(raw)
             dims = "%dx%d" % struct.unpack(">II", raw[16:24])
         except Exception:
@@ -548,10 +685,10 @@ def _describe_png(data, rel, label):
     print("    模块 %d 字节 | 内嵌 PNG %d 字节 | %s" % (len(data), png_len, dims))
 
     # 吉祥物模块额外报告皮肤模型类型
-    if label == "吉祥物皮肤" and m:
+    if label == "吉祥物皮肤" and b64_text:
         try:
             Image = pillow()
-            skin = Image.open(io.BytesIO(base64.b64decode(m.group(1))))
+            skin = Image.open(io.BytesIO(base64.b64decode(b64_text)))
             detected = detect_skin_variant(skin) or "?"
             declared = _declared_variant(text)
             flag = "" if detected == declared else "  ← 不一致（手臂会错位）"

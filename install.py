@@ -403,8 +403,14 @@ def step_icons(root, icon_path, dry=False, targets=None):
     """
     替换程序图标。
 
-    两阶段提交：先把所有目标构建到临时文件并逐一验证，
-    全部通过后才统一替换——任何一个失败都不会改动原文件。
+    三阶段流程（比原来的两阶段更稳）：
+      ① 预检：逐一探测每个目标能否被替换。有任何一个被占用就**整体放弃**，
+         原文件全部不动 —— 避免"改了一半"的中间态。
+      ② 构建：把补丁结果写到临时文件并做结构校验 + 加载器校验。
+      ③ 提交：逐个 os.replace，每个都独立捕获异常。即便某个在最后关头
+         因抢占失败，已完成的部分会如实汇报，不会误报"全部成功"。
+
+    返回 (是否全部成功, 已替换数, 失败列表)
     """
     head('② 程序图标')
     tgt = patch_icons.find_targets(root)
@@ -413,19 +419,51 @@ def step_icons(root, icon_path, dry=False, targets=None):
         warn('未找到可替换的 exe，跳过')
         return False
 
+    def label_of(kind):
+        return '启动器本体' if kind == 'runtime' else '便携安装器'
+
     for kind, path in active.items():
-        print('  目标：%s' % path)
+        print('  目标：%s（%s）' % (path, label_of(kind)))
+
     try:
-        pngs = patch_icons.make_icon_pngs(icon_path)
+        # 按各目标真实容量算预算，取最紧的那个（安装器的 .rsrc 通常最小）
+        budgets = []
+        for kind, path in active.items():
+            try:
+                b, _ = patch_icons.compute_icon_budget(patch_icons.PE(path))
+                budgets.append(b)
+                dim('%s 图标预算 ≈ %d 字节' % (label_of(kind), b))
+            except Exception as exc:
+                dim('%s 预算计算失败：%s' % (label_of(kind), exc))
+        budget = min(budgets) if budgets else None
+
+        pngs = patch_icons.make_icon_pngs(icon_path, budget)
         if dry:
             dim('[试运行] 将写入 %d 个尺寸' % len(pngs))
             return True
 
-        # ---- 阶段一：构建到临时文件并验证 ----
+        # ---- ① 预检：所有目标都必须可替换 ----
+        blocked = []
+        for kind, path in active.items():
+            writable, why = safe_replace.check_writable(path, label_of(kind))
+            if not writable:
+                blocked.append((label_of(kind), path, why))
+        if blocked:
+            err('以下文件当前无法替换：')
+            for label, path, why in blocked:
+                print('      %s：%s' % (label, why))
+            print('  为避免"改了一半"，本次不做任何改动。请：')
+            print('      · 关闭资源管理器窗口（尤其是停在 KAMUCL 目录的预览）')
+            print('      · 暂时关闭杀毒软件的实时防护')
+            print('      · 确认 KAMUCL 及安装器进程已完全退出')
+            print('  然后重新运行。')
+            return False
+
+        # ---- ② 构建到临时文件并验证 ----
         staged = []
         try:
             for kind, path in active.items():
-                label = '启动器本体' if kind == 'runtime' else '便携安装器'
+                label = label_of(kind)
                 tmp = path + '.kamucl-tmp'
 
                 def write(t, _p=path):
@@ -435,7 +473,7 @@ def step_icons(root, icon_path, dry=False, targets=None):
                 safe_replace.safe_replace_pre(path, write, label=label)
                 staged.append((path, tmp, label))
         except Exception:
-            # 任一失败：清理已生成的临时文件，原文件全部未动
+            # 任一构建失败：清理临时文件，原文件全部未动
             for _, tmp, _ in staged:
                 if os.path.exists(tmp):
                     try:
@@ -444,13 +482,39 @@ def step_icons(root, icon_path, dry=False, targets=None):
                         pass
             raise
 
-        # ---- 阶段二：全部通过，统一替换 ----
+        # ---- ③ 逐个提交，独立捕获异常 ----
+        done, failed = [], []
         for path, tmp, label in staged:
-            os.replace(tmp, path)
-            dim('%s 已替换' % label)
+            try:
+                os.replace(tmp, path)
+                dim('%s 已替换' % label)
+                done.append((label, path))
+            except OSError as exc:
+                # 极端情况下预检通过但提交时被抢占
+                failed.append((label, path, exc))
+                if os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
 
-        ok('程序图标已替换（%d 个文件）' % len(staged))
-        return True
+        print()
+        if not failed:
+            ok('程序图标已替换（%d 个文件）' % len(done))
+            return True
+
+        # 部分成功：如实汇报，不谎称全部完成
+        if done:
+            ok('已替换 %d 个：%s' % (len(done), '、'.join(l for l, _ in done)))
+        err('失败 %d 个：' % len(failed))
+        for label, path, exc in failed:
+            print('      %s：%s' % (label, exc))
+            if getattr(exc, 'winerror', None) == 32:
+                print('        （文件被占用，关掉资源管理器预览/杀毒软件后'
+                      '单独重跑：python patch_icons.py --target %s）'
+                      % ('installer' if 'installer' in path.lower() else 'runtime'))
+        warn('未被替换的目标保持原样，不需要回滚。')
+        return False
     except Exception as e:
         err('失败：%s' % e)
         raise
@@ -532,6 +596,7 @@ def cmd_list(root, asar, userdata):
             a = patch_splash_avatar.Asar(asar)
             for rel in a.list_splash_faces():
                 txt = a.read(rel).decode('utf-8', 'replace')
+                # 头像模块只有一个内嵌 PNG，取第一个即可
                 m = re.search(r'base64,([A-Za-z0-9+/=]+)', txt)
                 if m:
                     raw = base64.b64decode(m.group(1))
@@ -539,9 +604,10 @@ def cmd_list(root, asar, userdata):
                         (len(raw), *struct.unpack('>II', raw[16:24])))
             for rel in a.list_mascot_modules():
                 txt = a.read(rel).decode('utf-8', 'replace')
-                m = re.search(r'const skinUrl = "data:image/png;base64,([A-Za-z0-9+/=]+)', txt)
-                if m:
-                    raw = base64.b64decode(m.group(1))
+                # 兼容可读变量名与 mangle 版本：按尺寸取 64x64 那张
+                b64 = patch_splash_avatar._skin_data_url(txt)
+                if b64:
+                    raw = base64.b64decode(b64)
                     dim('吉祥物皮肤：%d 字节，%dx%d' %
                         (len(raw), *struct.unpack('>II', raw[16:24])))
                     try:
@@ -679,20 +745,24 @@ def main():
         err('图标文件不存在：%s' % icon_path)
         sys.exit(1)
 
+    # 收集各步结果；图标失败不再中断，其余步骤继续，最后如实汇总
+    outcome = {'splash': None, 'icons': None, 'plugin': None}
     try:
         if not args.no_splash or not args.no_mascot:
-            step_splash_avatar(asar, skin_path, args.dry_run,
-                               do_splash=not args.no_splash,
-                               do_mascot=not args.no_mascot,
-                               variant=skin_variant)
+            outcome['splash'] = step_splash_avatar(
+                asar, skin_path, args.dry_run,
+                do_splash=not args.no_splash,
+                do_mascot=not args.no_mascot,
+                variant=skin_variant)
         if not args.no_icon:
-            step_icons(root, icon_path, args.dry_run)
+            outcome['icons'] = step_icons(root, icon_path, args.dry_run)
         if not args.no_plugin:
-            step_plugin(userdata, args.dry_run)
+            outcome['plugin'] = step_plugin(userdata, args.dry_run)
     except Exception as e:
         print()
         err('执行中断：%s' % e)
-        print('  采用「先验证再替换」，失败时原文件从未被修改，无需回滚。')
+        print('  每一步都是「先验证再替换」，已完成的部分有效，'
+              '失败的目标保持原样，无需回滚。')
         _cleanup_tmp_files(root)
         sys.exit(1)
     finally:
@@ -706,11 +776,29 @@ def main():
     print()
     if args.dry_run:
         print('%s试运行完成，未写入任何文件。%s' % (C_OK, C_END))
-    else:
-        print('%s全部完成！%s' % (C_OK, C_END))
-        print('  重启 KAMUCL 即可看到新的启动动画头像、吉祥物皮肤、程序图标和界面头像。')
+        return
+
+    # 汇总：有失败就明确列出，不谎称"全部完成"
+    problems = []
+    if outcome['splash'] is False:
+        problems.append('启动动画头像 / 吉祥物皮肤')
+    if outcome['icons'] is False:
+        problems.append('程序图标')
+    if outcome['plugin'] is False:
+        problems.append('界面头像插件')
+
+    if problems:
+        warn('以下部分未完成：%s' % '、'.join(problems))
+        print('  已成功的部分立即生效；未完成的按上面的提示处理后'
+              '重新运行即可（重复运行是安全的，已完成的会跳过）。')
         print()
         print('  查看：python install.py --list')
+        sys.exit(1)
+
+    print('%s全部完成！%s' % (C_OK, C_END))
+    print('  重启 KAMUCL 即可看到新的启动动画头像、吉祥物皮肤、程序图标和界面头像。')
+    print()
+    print('  查看：python install.py --list')
 
 
 if __name__ == '__main__':

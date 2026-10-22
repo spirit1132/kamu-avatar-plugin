@@ -413,14 +413,25 @@ def _quantize(img):
         return img
 
 
+def _png_len(im):
+    return len(_png_bytes(im))
+
+
 def make_icon_pngs(src_path, budget=None):
     """
     读入任意图片，产出 {size: png_bytes}（正方形）。
 
-    budget: 可选的总字节预算。超出时依次尝试：
-      1) 量化到调色板（体积通常减半以上）
-      2) 缩小超大尺寸（256 -> 128）
-    像素风图片用 NEAREST 缩放保持锐利。
+    budget 是**所有尺寸 PNG 合计**的字节上限。超出时按以下顺序降级，
+    每降一级都重新核算实际总量，**直到真的放得下为止**：
+
+      1. 去掉 256×256（很多 .rsrc 节根本塞不下它，且小图标用不到）
+      2. 逐级量化到调色板（P 模式），且**只采纳确实变小了的**尺寸
+      3. 继续丢大尺寸：128 → 64
+      4. 最后丢掉 48，只保留 16/24/32
+
+    旧版的问题：超预算时一次性砍到「量化 + 去掉 256」，然后**不再复核**，
+    结果仍可能超出（安装器的 .rsrc 只有 16384 字节）。现在改成循环收敛，
+    并在最后打印实际占用，方便判断。
     """
     Image = pillow()
     img = Image.open(src_path)
@@ -435,37 +446,75 @@ def make_icon_pngs(src_path, budget=None):
                         (w - side) // 2 + side, (h - side) // 2 + side))
         print('  源图 %dx%d 非正方形，已居中裁为 %dx%d' % (w, h, side, side))
 
-    def render(sizes, quantize):
-        out = {}
-        for size in sizes:
-            # 小尺寸且源图远大于目标时用 NEAREST，避免糊成一团
-            resample = Image.NEAREST if (size <= 48 and w >= 4 * size) else Image.LANCZOS
-            im = img.resize((size, size), resample)
-            if quantize:
-                im = _quantize(im)
-            out[size] = _png_bytes(im)
-        return out
+    def render(size, quantize):
+        resample = (Image.NEAREST if (size <= 48 and w >= 4 * size)
+                    else Image.LANCZOS)
+        im = img.resize((size, size), resample)
+        raw = _png_bytes(im)
+        if quantize:
+            q = _quantize(im)
+            if q is not im:
+                qb = _png_bytes(q)
+                # 量化只在真的更小时才采纳（小图量化常常反而变大）
+                if len(qb) < len(raw):
+                    return qb
+        return raw
+
+    def build(sizes, quantize):
+        return {s: render(s, quantize) for s in sizes}
 
     sizes = list(ICON_SIZES)
-    out = render(sizes, quantize=False)
+    out = build(sizes, quantize=False)
     total = sum(len(v) for v in out.values())
     print('  编码 RGBA：合计 %d 字节' % total)
 
-    if budget is not None and total > budget:
-        q = render(sizes, quantize=True)
-        qt = sum(len(v) for v in q.values())
-        print('  超出预算，改用调色板量化：合计 %d 字节' % qt)
-        if qt <= budget:
-            out, total = q, qt
-        else:
-            # 再降：去掉 256，最大到 128
-            small = [s for s in sizes if s <= 128]
-            q2 = render(small, quantize=True)
-            q2t = sum(len(v) for v in q2.values())
-            print('  仍然超出，去掉 256x256：合计 %d 字节' % q2t)
-            out, total = q2, q2t
+    if budget is None or total <= budget:
+        return out
 
-    return out
+    print('  超出预算 %d 字节，开始降级' % budget)
+
+    # 降级阶梯：**先量化保住尺寸，再考虑丢尺寸**。
+    # 量化通常能把体积砍掉 50%~80%，比直接丢掉 256/128 划算得多
+    # （用户想要的是大图标能显示，而不是"能装上但只有小图"）。
+    ladder = []
+    for quant in (True, False):
+        for allow_max in (256, 128, 64, 48):
+            keep = [s for s in ICON_SIZES if s <= allow_max]
+            ladder.append((keep, quant))
+    # 保底：16/24/32
+    ladder.append(([16, 24, 32], True))
+
+    seen = set()
+    best = None
+    for keep, quant in ladder:
+        key = (tuple(keep), quant)
+        if key in seen:
+            continue
+        seen.add(key)
+        cand = build(keep, quantize=quant)
+        t = sum(len(v) for v in cand.values())
+        tag = '量化' if quant else 'RGBA'
+        biggest = max(keep)
+        print('    尝试 最大 %3d（%s）：%d 字节 %s'
+              % (biggest, tag, t, '✓' if t <= budget else '✗'))
+        if t <= budget:
+            best = (cand, t)
+            break
+        if best is None or t < sum(len(v) for v in best[0].values()):
+            best = (cand, t)
+
+    if best is None:
+        best = (build([16, 24, 32], quantize=True), 0)
+
+    cand, t = best
+    if t > budget:
+        print('  ! 已降级到最小可用集合，仍需 %d 字节（预算 %d）。' % (t, budget))
+        print('    安装器 .rsrc 节容量有限，请换一张更简单的图标，')
+        print('    或单独给安装器用简化图标：--icon simple.png --target installer')
+    else:
+        print('  ✓ 降级后合计 %d 字节，尺寸：%s'
+              % (t, '/'.join(str(s) for s in sorted(cand))))
+    return cand
 
 
 # -------------------------------------------------------------------- 主流程
@@ -536,8 +585,54 @@ def do_list(targets):
                       % (it['w'], it['h'], it['bits'], it['size']))
 
 
+def compute_icon_budget(pe):
+    """
+    算出这个 PE 的 .rsrc 节**最多能容纳多少字节的新图标数据**。
+
+    重建时 `.rsrc` 会被整体重排：
+        节内容 = [目录树 + 数据条目表] + [各资源数据，4 字节对齐]
+    数据区从 region_start 开始，之后的可用空间是 rsize - region_start。
+
+    旧版公式 `rsize - used + old_icon` 是错的：`used` 已经包含了旧图标，
+    再加一次 old_icon 等于把旧图标算了两遍，预算会虚高到超过节容量。
+
+    正确模型：
+        可用 = rsize - region_start
+               - group_size（重建的 RT_GROUP_ICON）
+               - 非图标资源（对话框/版本信息/清单等，必须原样保留）
+               - 对齐浪费
+
+    returns (budget_bytes, details dict)
+    """
+    rsrc = pe.rsrc_section()
+    ents = walk_entries(pe)
+
+    # 数据区起点：所有数据条目之后，4 字节对齐
+    region_start = max((e[3] + 16) for e in ents) if ents else 0
+    region_start = (region_start + 3) & ~3
+
+    # 非图标资源必须原样保留，它们占的空间不能算进预算
+    non_icon = sum(e[5] for e in ents if e[0] != RT_ICON and e[0] != RT_GROUP_ICON)
+
+    # RT_GROUP_ICON 会重建，预留 7 个尺寸的最坏情况
+    group_size = 6 + 14 * len(ICON_SIZES)
+
+    # 每个图标数据 4 字节对齐的浪费上界
+    align_waste = 3 * len(ICON_SIZES)
+
+    available = rsrc['rsize'] - region_start
+    budget = available - non_icon - group_size - align_waste
+    return max(0, budget), {
+        'rsize': rsrc['rsize'],
+        'region_start': region_start,
+        'available': available,
+        'non_icon': non_icon,
+        'group_size': group_size,
+    }
+
+
 def do_patch(targets, icon_path, which, dry_run=False):
-    # 先按每个目标的余量算出可用预算，取最紧的那个
+    # 先按每个目标的真实余量算出可用预算，取最紧的那个
     budgets = []
     active = []
     for kind, path in targets.items():
@@ -548,29 +643,36 @@ def do_patch(targets, icon_path, which, dry_run=False):
         active.append((kind, path))
         try:
             pe = PE(path)
-            rsrc = pe.rsrc_section()
-            # 新资源 = 原资源 - 原图标 + 新图标，故预算 = 余量 + 原图标总大小
-            old_icon = sum(it['size'] for items in pe.group_icons().values() for it in items)
-            budgets.append(rsrc['rsize'] - pe.rsrc_size + old_icon)
+            b, detail = compute_icon_budget(pe)
+            budgets.append(b)
+            label = '启动器本体' if kind == 'runtime' else '便携安装器'
+            print('  %s：.rsrc %d 字节，数据区起点 %d，非图标资源 %d'
+                  % (label, detail['rsize'], detail['region_start'],
+                     detail['non_icon']))
+            print('  %s：可用图标预算 ≈ %d 字节' % (label, b))
         except Exception as e:
             print('%s 解析失败：%s' % (path, e))
     budget = min(budgets) if budgets else None
 
+    print()
     print('生成图标尺寸（可用预算 %s 字节）：' % (budget if budget else '不限'))
     pngs = make_icon_pngs(icon_path, budget)
     for size in sorted(pngs):
         print('  %3dx%-3d %6d 字节' % (size, size, len(pngs[size])))
     print('  合计 %d 字节' % sum(len(v) for v in pngs.values()))
 
+    ok_count = 0
     for kind, path in active:
         label = '启动器本体' if kind == 'runtime' else '便携安装器'
         print('\n[%s] %s' % (label, path))
         try:
             patch_pe_icons(path, pngs, dry_run)
+            ok_count += 1
         except PEError as e:
             print('  失败：%s' % e)
         except PermissionError:
             print('  失败：文件被占用，请先关闭 KAMUCL 再试')
+    return ok_count == len(active)
 
 
 

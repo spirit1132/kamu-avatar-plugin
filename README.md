@@ -268,19 +268,42 @@ python patch_icons.py --icon my_icon.png --dry-run
 
 - **正方形**，256×256 或更大（非正方形会自动居中裁剪）
 - 像素风图片（如 Minecraft 头像）效果最好，体积也最小
-- 抗锯齿的复杂图片也可以，工具会自动量化压缩以适应空间限制
-- 如果图标太复杂放不下，工具会自动去掉 256×256 再试
+- 抗锯齿的复杂图片也可以，工具会**逐级降级**直到塞得下
 
-### 空间限制
+### 空间限制与自动降级
 
-两个文件的 `.rsrc` 节剩余空间不同，工具会自动按**最紧的那个**来压缩：
+图标数据必须放进 PE 的 `.rsrc` 节。工具按下面的模型算出**真实可用预算**：
 
-| 文件 | 节容量 | 原图标占用 | 可用预算 |
-|---|---|---|---|
-| `KAMUCL.exe` | 99840 | 13273 | 37294 字节 |
-| `KAMUCL-1.1.21.exe` | 16384 | 13273 | 13505 字节 |
+```
+可用 = 节容量 - 数据区起点 - 非图标资源(对话框/版本信息/清单) - RT_GROUP_ICON - 对齐浪费
+```
 
-所以图标总大小要控制在 **约 13 KB** 以内（工具会自动尝试压缩并提示）。
+各版本实测（`1.1.48`）：
+
+| 文件 | 节容量 | 数据区起点 | 非图标资源 | 可用预算 |
+|---|---|---|---|---|
+| `KAMUCL.exe` | 99328 | 2872 | 59105 | **37226 字节** |
+| `KAMUCL-1.1.21.exe` | 16384 | 760 | 1986 | **13513 字节** |
+
+超出预算时按阶梯降级，**每降一级都重新核算实际总量**，直到真的放得下：
+
+```
+超出预算 13513 字节，开始降级
+  尝试 最大 256（量化）：88509 字节 ✗
+  尝试 最大 128（量化）：28243 字节 ✗
+  尝试 最大  64（量化）：12047 字节 ✓
+✓ 降级后合计 12047 字节，尺寸：16/24/32/48/64
+```
+
+优先级是**先量化保住尺寸，再考虑丢尺寸** —— 量化通常能砍掉 50%~80% 体积，
+比直接丢掉 256/128 划算（用户要的是"图标能正常显示"，不是"能装上但只有小图"）。
+
+> 旧版有两个缺陷：① 超预算时一次性砍到「量化 + 去掉 256」然后**不再复核**，
+> 结果仍可能超出；② 即使预算很小也**整批量化**，让本来放得下的小图反而变大
+> （16×16 从 468 → 1215 字节）。现在逐尺寸判断"量化后是否真的更小"才采纳。
+
+**最小保底**是 16/24/32 三个尺寸。如果连这个都放不下，工具会明确告诉你，
+并建议换简单图标或只处理其中一个目标。
 
 ---
 
@@ -328,14 +351,41 @@ asar 文件结构（Chromium Pickle）：
 
 | 目标 | asar 内路径 | 内嵌内容 |
 |---|---|---|
-| 启动动画头像 | `out/renderer/assets/splash-face-*.js` | `faceUrl`，256×256 头部 PNG |
-| 吉祥物皮肤 | `out/renderer/assets/MascotStage-*.js` | `skinUrl`，64×64 全身皮肤 PNG |
+| 启动动画头像 | `out/renderer/assets/splash-face-*.js` | 256×256 头部 PNG |
+| 吉祥物皮肤 | `out/renderer/assets/MascotStage-*.js` | 64×64 全身皮肤 PNG |
 
-吉祥物模块里还有 `palmUrl` / `printUrl` 两个 15×15 反馈小图，正则只匹配
-`skinUrl`，它们原样保留。两个目标同属一个 asar，工具合并成**一次写入**，
-避免重复重写 18.9MB 文件。
+吉祥物模块里还有 palm / print 两个 15×15 反馈小图，**原样保留**。
+两个目标同属一个 asar，工具合并成**一次写入**，避免重复重写 20+MB 文件。
 
-**只有目标模块的内容被改动，其余 380 个文件逐字节保持不变。**
+**只有目标模块的内容被改动，其余文件逐字节保持不变。**
+
+#### 跨版本兼容：变量名会变
+
+不同 KAMUCL 版本的压缩程度不同，**内嵌资源的变量名不一定可读**：
+
+| 版本 | 启动动画 | 吉祥物皮肤 | 手掌/指纹 | 皮肤赋值 |
+|---|---|---|---|---|
+| 1.1.21 | `const faceUrl=` | `const skinUrl=` | `const palmUrl=` / `printUrl=` | `player.skin.map = skin;` |
+| 1.1.48 | `const U=` | `const La=` | `const Da=` / `Ra=` | `h.skin.map=b,` |
+
+所以工具不写死变量名，而是**双路径定位**：
+
+1. **优先认变量名**（`faceUrl` / `skinUrl`）—— 未压缩版本最精确
+2. **退回按 data URL 序号 + PNG 尺寸校验** —— 压缩版本用这个
+
+尺寸校验是关键：吉祥物模块里有 3 个 data URL（皮肤 64×64、手掌 15×15、指纹 15×15），
+只有尺寸**正好 64×64** 的那一个才会被替换，小图绝不会被误伤。
+
+模型类型声明同理，用 `<标识符>.skin.map=<标识符>` 匹配前缀后插入
+`<同一标识符>.skin.modelType="slim"|"default";`，因此 `player.skin` 和 `h.skin` 都适用。
+
+> 1.1.48 的 `SkinObject` 虽然被压缩，`modelType` 的 getter/setter 仍然完整保留：
+> ```js
+> get modelType(){return this.slim?"slim":"default"}
+> set modelType(e){this.slim=e==="slim",this.modelListeners.forEach(t=>t())}
+> ```
+> 所以 slim 写入依然生效。另外该版本的吉祥物模块**自身不设置** modelType，
+> 与 1.1.21 的缺陷一致，必须由工具补上。
 
 ### 图标补丁
 
@@ -417,20 +467,58 @@ CreateProcessW:
 本工具**不生成任何备份文件**。取而代之的是一套「先验证再替换」流程：
 
 ```
-① 构建补丁结果，写入同目录临时文件（<文件名>.kamucl-tmp）
-② 校验：
+① 预检（exe）：逐一探测每个目标能否被替换
+   · 目录可写？（写一个探针文件再删掉）
+   · 文件本身没被独占？用 CreateFileW 以 FILE_SHARE_NONE 打开，
+     被占用会返回 WinError 32
+   任何一个不可替换 => 整体放弃，原文件全部不动
+② 构建补丁结果，写入同目录临时文件（<文件名>.kamucl-tmp）
+③ 校验：
    · exe 补丁 —— 结构性校验：逐字节比对补丁前后，确认只改动了 .rsrc 节，
      PE 头部与代码段等其它区域零改动
    · asar 补丁 —— 完整性校验：重建后读回目标模块，比对 SHA256 与
      头部 integrity 字段，确认数据可正确寻址
-③ 加载器校验（exe）：用 CREATE_SUSPENDED 创建进程（挂起状态，不执行任何代码），
-   验证 Windows 能真正映射该映像
-④ 全部通过才 os.replace() 覆盖原文件（NTFS 上是原子操作）
+   · 加载器校验（exe）：用 CREATE_SUSPENDED 创建进程（挂起状态，不执行
+     任何代码），验证 Windows 能真正映射该映像
+④ 提交：逐个 os.replace()，**每个都独立捕获异常**
 ⑤ 任一步失败：删除临时文件，原文件从未被修改
 ```
 
-替换多个文件时采用**两阶段提交**：所有目标都通过 ①-③ 后才统一执行 ④，
-避免"第一个成功、第二个失败"的中间状态。
+### 为什么要有第 ① 步
+
+旧版只用「构建 → 验证 → 替换」，但**替换阶段是不受保护的循环**：
+
+```python
+for path, tmp, label in staged:
+    os.replace(tmp, path)      # 第一个成功、第二个抛 WinError 32
+```
+
+结果就是"启动器改了、安装器没改"的中间态，而提示语还说
+「失败时原文件从未被修改，无需回滚」—— 这句话在这种场景下是**错的**。
+
+现在提前探测，被占用的文件在动手之前就被拦下：
+
+```
+✗ 以下文件当前无法替换：
+    便携安装器：正被其他程序使用（WinError 32，请关闭资源管理器预览/杀毒软件）
+  为避免"改了一半"，本次不做任何改动。请：
+      · 关闭资源管理器窗口（尤其是停在 KAMUCL 目录的预览）
+      · 暂时关闭杀毒软件的实时防护
+      · 确认 KAMUCL 及安装器进程已完全退出
+  然后重新运行。
+```
+
+极端情况下预检通过、提交时仍被抢占（第 ④ 步），则会**如实汇报部分成功**：
+
+```
+✓ 已替换 1 个：启动器本体
+✗ 失败 1 个：
+      便携安装器：……（文件被占用……）
+! 未被替换的目标保持原样，不需要回滚。
+```
+
+`install.py` 也不再假装"全部完成 —— 有任何一步失败都会列出未完成的部分，
+并以退出码 1 结束。**重复运行是安全的**（已完成的步骤幂等跳过）。
 
 恢复方法：本工具不做备份，因此打完补丁后若发现异常，
 **重新运行 KAMUCL 的安装器即可完全恢复原状**（安装器会从内嵌的
@@ -489,8 +577,8 @@ plugin.json
 ### 运行环境要求
 
 - **Windows**（脚本调用 Win32 API 与 `tasklist`/`taskkill`，不支持 Linux/macOS）
-- **Python 3.6 或更高**
-- **Pillow**（图像处理）——**缺失时会自动安装**
+- **Python 3.6 或更高** —— 没有时会**自动下载安装**（华为云镜像优先）
+- **Pillow** —— 没有时会**自动从清华镜像安装**
 
 ### 环境检查与自动安装
 
@@ -519,21 +607,78 @@ python env_check.py --no-install # 只检查，不安装
   ✓ pip 可用
 ```
 
-自动安装会按顺序尝试，直到成功：
+自动安装会**优先走清华镜像**，按顺序尝试直到成功：
 
-1. 默认源 `python -m pip install --upgrade Pillow`
-2. `--user` 模式（应对全局站点包无写权限）
-3. 清华镜像、阿里云镜像（应对默认源超时）
+1. 清华镜像 `-i https://pypi.tuna.tsinghua.edu.cn/simple`
+2. 阿里云镜像
+3. 官方源（兜底）
+
+每个源还会再用 `--user` 试一次（应对全局站点包只读）。
+
+**为什么镜像放第一**：pip 内置连接超时 15 秒，遇到拥塞的 pypi.org 会长时间
+没有进度条地挂着，用户会以为卡死。国内实测同一个包（Pillow 7.3 MB）：
+
+| 源 | 耗时 |
+|---|---|
+| 默认源 `pypi.org` | **63 秒** |
+| 清华镜像 | **4 秒** |
+
+同时给每次尝试加了 `--timeout 60 --retries 1`，失败就快速换下一个源。
 
 若连 pip 都没有（精简版 Python、部分 venv），会先跑
 `python -m ensurepip --upgrade` 把 pip 修好再装，**不需要联网下载 get-pip**。
 
 安装完会再复查一次 `import`，防止 pip 报告成功但实际装到了别的解释器。
-全部失败时给出可直接复制执行的命令，包括：
 
-- 三条安装命令（默认 / `--user` / 镜像）
-- `ensurepip` 修复命令
-- 设置全局镜像源的命令（国内网络慢时）
+### 自动安装 Python（连 Python 都没有时）
+
+`一键美化.bat` 启动时**实际执行** python 来确认它可用，而不是只查文件是否存在。
+找不到可用 Python 时给出三选一：
+
+```
+  [NOTE] No usable Python found on this machine.
+
+  This can happen when only the Microsoft Store stub exists:
+    C:\Users\...\AppData\Local\Microsoft\WindowsApps\python.exe
+
+  The tool can download and install Python for you.
+  Source: Huawei Cloud mirror (faster in China) with python.org fallback.
+
+    1) Auto-install Python 3.13 (+ Pillow)  [recommended]
+    2) Open the download page and install manually
+    3) Exit
+```
+
+选 `1` 后自动：
+
+1. 从**华为云镜像**下载 Python 安装包（约 27 MB，带百分比进度），失败退到 python.org
+2. 静默安装，参数为：
+
+   ```
+   /quiet InstallAllUsers=0 PrependPath=1 Include_pip=1
+   Include_test=0 Include_launcher=1 AssociateFiles=0 Shortcuts=0
+   ```
+
+   仅装到当前用户、**不需要管理员权限**，自动加入 PATH、自带 pip。
+3. 重新解析 PATH 并验证真的能跑，然后继续装 Pillow
+
+也可以用命令行触发：
+
+```cmd
+python env_check.py --install-python
+python env_check.py --install-python --python-version 3.12.8
+```
+
+> **为什么不能只信 `where python`**
+>
+> Windows 自带的“应用执行别名”
+> `%LOCALAPPDATA%\Microsoft\WindowsApps\python.exe` 是个 **0 字节占位程序**。
+> `where` 会把它当作“找到了”，但只要真正执行它，结果是**零输出 + 退出码 9009**。
+> 旧版 bat 因此出现最误导的错误：环境检查明明没跑起来，却报
+> `Environment check failed`，让人以为是 Pillow 的问题。
+>
+> 现在两处都改成实际执行验证：bat 让它写出版本号到临时文件再读回，
+> Python 侧用 `find_python_exe()` 跑 `-c` 并检查输出形如 `3.13.11`。
 
 **控制环境行为的开关：**
 
@@ -541,6 +686,8 @@ python env_check.py --no-install # 只检查，不安装
 |---|---|
 | `--no-install-deps`（install.py） | 缺依赖时不自动安装，只提示 |
 | `--yes` / `-y` | 自动安装时不询问 |
+| `--install-python`（env_check.py） | Python 不可用时自动下载安装 |
+| `--python-version X.Y.Z` | 指定要安装的 Python 版本 |
 | 环境变量 `KAMUCL_NO_INSTALL=1` | 任何脚本都不安装，只提示 |
 | 环境变量 `KAMUCL_YES=1` | 任何脚本都不询问，直接装 |
 

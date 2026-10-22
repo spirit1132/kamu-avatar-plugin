@@ -20,6 +20,7 @@
 """
 
 import argparse
+import base64
 import io
 import os
 import re
@@ -108,19 +109,39 @@ def test_detect(tmp):
         check('%dx%d classic' % (64 * scale, 64 * scale), c == 'classic', c)
 
 
-def test_module_switch(tmp):
-    section('2. 模块内模型类型写入 / 切换')
+def _b64(img):
+    buf = io.BytesIO()
+    img.save(buf, 'PNG', optimize=True)
+    return base64.b64encode(buf.getvalue()).decode('ascii')
 
-    template = b'''
-const skinUrl = "data:image/png;base64,AAAA";
-const palmUrl = "data:image/png;base64,BBBB";
-const printUrl = "data:image/png;base64,CCCC";
+
+def _template_legacy(skin_b64):
+    """1.1.21 等未压缩版本：变量名可读。"""
+    return ('''
+const skinUrl = "data:image/png;base64,%s";
+const palmUrl = "data:image/png;base64,%s";
+const printUrl = "data:image/png;base64,%s";
 function boot() {
     player = new PreviewPlayer();
         player.skin.map = skin;
         player.skin.setOuterLayerVisible(false);
 }
-'''
+''' % (skin_b64, _b64(Image.new('RGBA', (15, 15), (1, 2, 3, 255))),
+       _b64(Image.new('RGBA', (15, 15), (4, 5, 6, 255))))).encode()
+
+
+def _template_mangled(skin_b64):
+    """1.1.48 等压缩版本：变量名被 mangle 成单字母，赋值用逗号串联。"""
+    return ('''
+const La="data:image/png;base64,%s",Da="data:image/png;base64,%s",Ra="data:image/png;base64,%s";
+function boot(){h=new da,h.skin.map=b,h.skin.setOuterLayerVisible(!1),h.skin.position.y=16.8;}
+''' % (skin_b64, _b64(Image.new('RGBA', (15, 15), (1, 2, 3, 255))),
+       _b64(Image.new('RGBA', (15, 15), (4, 5, 6, 255))))).encode()
+
+
+def test_module_switch(tmp):
+    section('2. 模块内模型类型写入 / 切换')
+
     slim_dir = os.path.join(tmp, 'slim.png')
     cls_dir = os.path.join(tmp, 'classic.png')
     make_skin(True).save(slim_dir)
@@ -131,34 +152,36 @@ function boot() {
     check('prepare 判定 slim', var_s == 'slim', var_s)
     check('prepare 判定 classic', var_c == 'classic', var_c)
 
-    mod_s = P.build_mascot_module(png_s, template, var_s)
-    check('slim 写入一条声明',
-          mod_s.count(b'player.skin.modelType') == 1,
-          str(mod_s.count(b'player.skin.modelType')))
-    check('slim 声明值为 slim', P._declared_variant(mod_s.decode()) == 'slim')
+    results = {}
+    for style, mk in (('1.1.21 风格', _template_legacy),
+                      ('1.1.48 风格', _template_mangled)):
+        template = mk(_b64(make_skin(False)))
+        mod_s = P.build_mascot_module(png_s, template, var_s)
+        mod_c = P.build_mascot_module(png_c, mod_s, var_c)
+        results[style] = (mod_s, mod_c)
 
-    mod_s2 = P.build_mascot_module(png_s, mod_s, 'slim')
-    check('slim 重复打幂等', mod_s2 == mod_s)
+        check('%s slim 写入一条声明' % style,
+              mod_s.count(b'.skin.modelType') == 1,
+              str(mod_s.count(b'.skin.modelType')))
+        check('%s slim 声明值正确' % style,
+              P._declared_variant(mod_s.decode()) == 'slim')
+        check('%s slim 幂等' % style,
+              P.build_mascot_module(png_s, mod_s, 'slim') == mod_s)
+        check('%s classic 覆盖 slim' % style,
+              P._declared_variant(mod_c.decode()) == 'classic')
+        check('%s classic 后无 slim 残留' % style, b'"slim"' not in mod_c)
+        check('%s classic 仍只一条声明' % style,
+              mod_c.count(b'.skin.modelType') == 1)
+        check('%s 再切回 slim' % style,
+              P._declared_variant(
+                  P.build_mascot_module(png_s, mod_c, 'slim').decode()) == 'slim')
 
-    mod_c = P.build_mascot_module(png_c, mod_s, var_c)
-    check('classic 覆盖 slim', P._declared_variant(mod_c.decode()) == 'classic')
-    check('classic 后无 slim 残留', b'"slim"' not in mod_c)
-    check('classic 仍只有一条声明',
-          mod_c.count(b'player.skin.modelType') == 1)
+    # 两种风格的语义必须一致
+    check('两种风格都只改皮肤，小图保留',
+          all(len(P.DATA_URL_RE.findall(m.decode())) == 3
+              for pair in results.values() for m in pair))
 
-    mod_c2 = P.build_mascot_module(png_c, mod_c, 'classic')
-    check('classic 重复打幂等', mod_c2 == mod_c)
-
-    mod_back = P.build_mascot_module(png_s, mod_c, 'slim')
-    check('再切回 slim', P._declared_variant(mod_back.decode()) == 'slim')
-    check('来回切换后仍只有一条声明',
-          mod_back.count(b'player.skin.modelType') == 1)
-
-    # 缩进沿用原文
-    line = [l for l in mod_s.decode().split('\n')
-            if 'player.skin.modelType' in l][0]
-    check('缩进与相邻行一致', line.startswith('        '), repr(line[:12]))
-
+    mod_s, mod_c = results['1.1.21 风格']
     return mod_s, mod_c
 
 
